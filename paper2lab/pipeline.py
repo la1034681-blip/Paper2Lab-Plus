@@ -45,6 +45,13 @@ def run_audit(
     plan_mode: bool = False,
     llm_planner: bool = False,
     llm_patch: bool = False,
+    # 会话级复用(阶段三第1步): 同会话内第二次跑同一输入时, 跳过解析
+    needs_index: Optional[bool] = None,
+    snapshot: Optional[tuple] = None,
+    # 快照键: 与 session.fingerprint 同源(论文+代码), 由 app.py 传入。
+    #   不自己算: 只有 app.py 有 pdf_bytes+code_bytes, 这里只有路径,
+    #   重读文件算指纹会污染性能。
+    session_fp: str = "",
 ) -> tuple:
     """执行完整审计, 返回 (AuditResult, Markdown 报告)。
 
@@ -64,6 +71,8 @@ def run_audit(
     **网页端默认 True** —— 界面就是 agent 入口：输入材料启动即由 AI 参与决定跑哪些环节
     （见 app.py 的「AI 参与决策」开关）。**规则版永远是兜底**：
     AI 不可用、想乱跳、提名越界，都会被程序挡回并留痕。
+    `needs_index` / `snapshot` / `session_fp`（阶段三第1步）: 会话级复用三元组, 由 app.py
+    的 T2 查得并传入; 同会话内第二次跑时跳过 PDF 解析与代码扫描。
     """
     job = Job(
         fingerprint=_fingerprint(pdf_path, code_path),
@@ -90,6 +99,25 @@ def run_audit(
         agent_budget=dict(agent_budget or {}),
         llm_planner=bool(llm_planner),
         llm_patch=bool(llm_patch),
+        # 会话级复用(阶段三第1步): 同会话内第二次跑, 跳过解析
+        needs_index=needs_index,
+        snapshot=snapshot,
     )
     run_job(job, progress=progress, plan_mode=plan_mode)
+
+    # 快路径(阶段三第1步): 若本轮是重解析, 把产物存进快照, 供下次复用。
+    #   快照键优先用 session_fp(论文+code, 与 session_lookup 同源);
+    #   不自己算: 只有 app.py 有 pdf_bytes+code_bytes, 这里只有路径,
+    #             重读文件算指纹会污染性能。
+    #   回退 job.fingerprint(论文 only) 时, 快照只会被同口径的 lookup 命中,
+    #   因此"漏传 session_fp"不会静默失效 (只是退化为论文粒度复用)。
+    if job.needs_index is not False and job.paper is not None and job.code is not None:
+        fp = session_fp or job.fingerprint
+        try:
+            from .session import get as _get_session
+            store = _get_session()
+            if store is not None:
+                store.store_snapshot(fp, job.paper, job.code)
+        except Exception:      # noqa: BLE001
+            pass
     return job.audit, job.report

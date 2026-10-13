@@ -185,6 +185,14 @@ def _rule_plan(job: Job, *, plan_mode: bool = True) -> Plan:
     if not notes:
         notes.append("材料齐备，未触发任何跳过规则")
 
+    # 上下文装配器(阶段三第2步): 会话记忆按"论文侧 vs 代码侧"对齐后的对照屏
+    #   —— 比一段人话更利于模型一眼对齐。
+    screen = getattr(job, "context_screen", None)
+    if screen is not None:
+        summary = _screen_summary(screen)
+        if summary:
+            notes.insert(0, summary)
+
     # 跨任务记忆命中的线索(只提示, 不影响上面的任何决策)
     for ln in (job.memory_lines or []):
         notes.insert(0, ln)
@@ -201,6 +209,26 @@ def _rule_plan(job: Job, *, plan_mode: bool = True) -> Plan:
 # 其余五件（读图 / Agent 补漏 / AI 归因 / 根因追查 / 补丁草案）是"尽力而为"的增益项，
 # 交给 AI 判断值不值得，但**必须在决策表里写明理由**，可复核。
 _MUST_RUN = {"parse_paper", "analyze_code", "align", "selfcheck", "report"}
+
+
+def _screen_summary(screen) -> Optional[str]:
+    """把装配好的上下文屏摘要成一行，给 planner 的 notes 用。
+
+    只说"有哪些参数在历史里存在对照"，不给值（值在模型侧的 prompt 里）。
+    """
+    try:
+        rows = screen.param_table or []
+    except AttributeError:
+        return None
+    if not rows:
+        return None
+    present = [
+        r.param_key for r in rows
+        if getattr(r, "paper", None) is not None and getattr(r, "code", None) is not None
+    ]
+    if not present:
+        return None
+    return f"【记忆对照】{len(present)} 个参数在历史记忆里同时有论文侧与代码侧线索: " + "、".join(present[:6])
 
 
 def _llm_prompt(job: Job, base: Plan) -> str:

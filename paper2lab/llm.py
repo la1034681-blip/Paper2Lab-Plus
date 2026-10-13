@@ -41,6 +41,10 @@ _MULTIMODAL_HINTS = (
     "gpt-4o", "gpt-4.1", "gpt-5", "o4-mini", "gemini", "claude-3", "claude-4",
     "claude-sonnet", "claude-opus", "mimo-v", "internvl", "llava", "minicpm-v",
     "step-1v", "ernie-4", "yi-vl", "pixtral", "phi-3.5-vision", "llama-3.2-vision",
+    # 书生 InternLM 系列（2026-10-11 接入）：S1 / S2 均自带视觉编码器、可读图；
+    # intern-latest 当前指向 intern-s2-preview-397b，同样多模态。
+    # 不写这两组会误判"模型不能读图"，导致读图通道被白白关掉。
+    "intern-s2", "intern-s1", "intern-latest",
 )
 
 

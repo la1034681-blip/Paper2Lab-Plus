@@ -85,12 +85,22 @@ class Job:
     execution_log: dict = field(default_factory=dict)
     fingerprint: str = ""                                # 论文指纹(跨任务记忆索引)
     memory_lines: list = field(default_factory=list)      # 记忆命中的线索(只提示)
+    # 上下文装配器(阶段三第2步): 会话记忆按"论文侧 vs 代码侧"装配成对照屏
+    context_screen: Optional[object] = None              # assembler.ContextScreen
+    # 会话级复用(阶段三第1步): 同会话内同一输入第二次跑, 跳过解析
+    needs_index: Optional[bool] = None                   # None=未知/未查; True=需解析; False=可复用
+    snapshot: Optional[tuple] = None                     # (paper, code) 复用产物
+    snapshot_reused: bool = False                       # 本次是否走了快路径(供界面展示)
 
 
 # ---------------------------------------------------------------- 工具执行体
 # 以下函数由 pipeline.run_audit 的既有步骤**逐行搬运**而来, 行为不变。
 
 def _run_parse_paper(job: Job, tick: Callable[[str], None]) -> None:
+    if job.snapshot_reused:
+        # 快路径: 复用上一轮的解析产物, 不重复读 PDF(仍打勾, 进度条如实)
+        tick("论文解析")
+        return
     job.paper = parse_paper(job.pdf_path)
     tick("论文解析")
 
@@ -120,6 +130,10 @@ def _run_fill_missing(job: Job, tick: Callable[[str], None]) -> None:
 
 
 def _run_analyze_code(job: Job, tick: Callable[[str], None]) -> None:
+    if job.snapshot_reused:
+        # 快路径: 代码扫描产物同上轮, 不重扫 AST
+        tick("代码扫描")
+        return
     job.code = analyze_code(job.code_path)
     tick("代码扫描")
 

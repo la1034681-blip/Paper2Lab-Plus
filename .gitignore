@@ -29,3 +29,8 @@ deploy/
 # 测试集与报告产物（体积大、且只在本地跑回归时才需要）
 Paper2Lab测试集/
 Paper2Lab测试集_v2/
+
+# 两个验证脚本的 stdout 重定向产物（verify_memory_capacity.py / verify_phase23.py
+# 把结果写到了工程根，纯本地台账，跟线上应用无关）
+_memc.txt
+_p23.txt

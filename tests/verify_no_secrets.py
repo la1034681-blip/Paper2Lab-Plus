@@ -38,6 +38,23 @@ def is_public_value(v: str) -> bool:
     low = v.lower()
     return not any(s in low for s in _TOKENISH_IN_URL)
 
+
+# 只有**键名看着像凭据**的才参与反查。
+# 为什么（2026-10-14 实测踩到）: 反查判据是"值 ≥12 字符"，而模型名 / 端点名
+# 也是长字符串 —— 从书生（intern-s2，9 字符）切到 DeepSeek（deepseek-chat，13 字符）后，
+# 模型名被当成"密钥"报了 7 处假阳性，闸门直接变成狼来了。
+# 模型名与端点是**公开配置**，不是秘密，不该参与凭据反查。
+_CRED_KEY = re.compile(r"(?i)(api[_\-]?key|secret|token|password|passwd|access[_\-]?key)")
+_NON_CRED_KEY = re.compile(r"(?i)(_url$|_base_url$|_model$|_name$|_id$|_host$|_endpoint$)")
+
+
+def is_credential(key: str) -> bool:
+    """键名是不是"凭据类"（要反查）—— 端点 / 模型名这类公开配置不算。"""
+    name = key.split(":")[-1]
+    if _NON_CRED_KEY.search(name):
+        return False
+    return bool(_CRED_KEY.search(name))
+
 # 通用密钥形态
 PATTERNS = {
     "OpenAI/DeepSeek 风格 sk-": re.compile(r"sk-[A-Za-z0-9_\-]{16,}"),
@@ -193,9 +210,11 @@ def main() -> int:
 
     # 2) 真值反查
     secrets = gather_real_secrets()
-    token_secs = {k: v for k, v in secrets.items() if not is_public_value(v)}
-    addr_secs = {k: v for k, v in secrets.items() if is_public_value(v)}
-    print(f"\n【2】真值反查（本地私有配置取了 {len(secrets)} 个值，长度≥{MIN_SECRET_LEN}）")
+    token_secs = {k: v for k, v in secrets.items()
+                  if is_credential(k) and not is_public_value(v)}
+    addr_secs = {k: v for k, v in secrets.items() if k not in token_secs}
+    print(f"\n【2】真值反查（本地私有配置取了 {len(secrets)} 个值，长度≥{MIN_SECRET_LEN}；"
+          f"其中凭据类 {len(token_secs)} 个）")
     if not secrets:
         print("  ⚠️ 没读到任何私有配置值，无法反查（.env 不存在？）")
     else:

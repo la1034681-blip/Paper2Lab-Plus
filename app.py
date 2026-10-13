@@ -22,6 +22,8 @@ from paper2lab.execview import agent_panel_title as _agent_panel_title
 from paper2lab.execview import tool_outcome as _tool_outcome
 from paper2lab.housekeeping import format_report as _purge_report
 from paper2lab.housekeeping import purge_run_state as _purge_run_state
+from paper2lab.housekeeping import session_clear as _session_clear
+from paper2lab.housekeeping import session_lookup as _session_lookup
 from paper2lab.models import Confidence, Finding, Status
 from paper2lab.pipeline import STEPS, TOOLS, run_audit
 
@@ -715,6 +717,46 @@ use_planner = not st.toggle(
 # 想关闭 AI 做对照：用下面的「兜底开关」（经典模式），或 CLI 走 run_audit(llm_planner=False)。
 _AI_ON = True
 
+# 🧬 多智能体对撞（第三期）：把"参数比对"这一步从单一路径换成三方独立抽取再对撞。
+# **默认关闭**，两个理由:
+#   ① 它是新增能力，默认关 = 经典路径不受影响（评委看到的默认行为与已验收版本一致）；
+#   ② 它依赖 langgraph（额外 14 个包）。线上若装不上，这里会自动回落经典版并说明，
+#      而不是整个页面崩掉 —— 见下面调用处的 try/except。
+use_multagent = st.toggle(
+    "🧬 多智能体对撞（三方独立审计 + 仲裁 + 红队，交叉验证）", value=False,
+    help="打开后，参数比对不再只走一条路径，而是:\n\n"
+         "**三个角色各只看自己该看的材料**（解析员只看论文、代码验证员只看代码、"
+         "数值验证员只看两侧已抽好的值）——隔离是代码层面强制的，不是靠提示词求它别看。\n\n"
+         "然后 **对撞**（两条路径的结论并排比对）→ **仲裁**（按证据强度裁决，不是投票）"
+         "→ **红队**（专挑结论漏洞，降幻觉）。对撞/仲裁/红队全是程序规则、不调模型，"
+         "所以可复现、可做消融对照。\n\n"
+         "**与经典版的关系**：结论以经典版（align 基线）为基准，对撞区做独立复核；"
+         "两路结果一致＝结论被互证，不一致＝**分歧本身也是发现**，会如实列出。"
+         "所以打开它不改结论，只是多一层独立验证和一组留痕。\n\n"
+         "需要额外依赖 langgraph；若当前环境装不上，会自动回落经典版并提示。")
+
+# 🧠 对撞区角色用模型（**默认关**）: 让三个角色各自把本侧的值**规范化**成可比对的标记
+# （论文写"余弦退火"、代码写 CosineAnnealingLR → 两边都归到 cosine）。
+# 为什么默认关: ① 线上成本必须严格为零（这是有意配置，不是漏配）；
+#               ② 它只影响"同一件事的不同写法"这一类判定，不开也不动主结论。
+# 隔离不破: 每个角色的 prompt 里只有它自己那一侧的材料，另一侧一个字符都不给。
+if use_multagent:
+    use_role_llm = st.toggle(
+        "🧠 对撞区角色用模型（规范化取值写法，默认关）", value=False,
+        help="**它做什么**：让解析员/代码验证员各自把本侧的参数值规范化成可比对的标记 ——"
+             "论文写「余弦退火」、代码写 `CosineAnnealingLR`，规则版会判成冲突，"
+             "模型能把两边都归到 `cosine`，于是判为一回事。\n\n"
+             "**它不做什么**：不抽取、不比对、不裁决。抽取 / 对撞 / 仲裁 / 红队全部照旧，"
+             "结论口径不变，只是多了一层「写法归一」。\n\n"
+             "**隔离仍然强制**：每个角色的 prompt 里只有它自己那一侧的材料"
+             "（解析员只看到论文侧、代码验证员只看到代码侧），另一侧一个字符都不给。\n\n"
+             "**失败怎么办**：没配 key / 调用失败 / 返回不合规，一律回退规则版，"
+             "并在角色留痕里如实写明「模型没参与」。\n\n"
+             "**要花钱**：会真实调用模型（数值型参数由程序自己归一，不花调用）。"
+             "线上默认无 key，所以保持关闭就是零成本。")
+else:
+    use_role_llm = False
+
 c1, c2, c3 = st.columns(3)
 with c1:
     st.markdown("""<div class="entry" style="--c:#3d63dd;--cl:#e8efff">
@@ -885,18 +927,20 @@ run = st.button("🚀 开 始 科 研 审 计", type="primary", use_container_wi
 
 # ================================================================ 执行
 if run:
-    # ---- 先清掉**上一轮的运行态**, 防止新审计失败时残留旧数据。
-    #      清的边界(见 paper2lab/housekeeping.py, 那里写死了口径, 界面与日志共用同一句):
-    #        · 运行缓存 cache/llm_cache.json / vision_cache.json —— 上一轮的中间结果,
-    #          清了只是本轮重新调用 API(慢一点、有费用), 不影响任何结论;
-    #        · 上一轮上传并落盘的临时文件(PDF / 代码 ZIP)。
-    #      留的边界:
-    #        · 跨任务记忆 cache/audit_memory.json —— 它是**记忆不是缓存**: 记的是
-    #          "这篇论文哪些参数没给确定值""参数出现在哪几页", 跨轮次跨任务复用,
-    #          删了下一轮就把它当新论文从头来。**不清**。
-    _purge = _purge_run_state(st.session_state.pop("_tmp_uploads", None) or [])
-    for _stale in ("audit", "report", "meta", "clar_done"):
-        st.session_state.pop(_stale, None)
+    # ---- 会话级生命周期(阶段二): 一个会话一个库, 进入先清, 超时自动清。
+    #      浏览器"关闭页面"事件不保证到达服务器, 因此"关页面即清"不可靠;
+    #      等价且可靠的替代 = T1(进入先清) + T3(超时清扫)。
+    #
+    #      会话 id 由服务端首次签发后写进 session_state, 前后端一致,
+    #      不靠客户端随机值(可伪造 / 碰撞)。
+    if not st.session_state.get("_p2l_sid"):
+        from paper2lab.session import new_id
+
+        st.session_state["_p2l_sid"] = new_id()
+    from paper2lab.session import set_current_id
+
+    set_current_id(st.session_state["_p2l_sid"])
+
     _new_uploads: list = []
 
     if has_upload:
@@ -914,6 +958,10 @@ if run:
         user_results = (json.loads(result_file.getvalue().decode("utf-8"))
                         if result_file else None)
         fingerprint = hashlib.sha1(pdf_bytes + code_bytes).hexdigest()[:10]
+        # 会话级复用键(阶段三第1步): 论文+代码, 与 session.fingerprint 同源,
+        #   交给 run_audit 当快照键; job.fingerprint 仍用 memory.fingerprint(只论文)
+        #   做跨任务记忆, 两条线口径不同, 不能混用。
+        session_fp = fingerprint
         meta = {"source": "用户上传",
                 "files": f"{pdf_file.name}"
                          + (f" + {code_file.name}" if code_file else "（未提供代码）")
@@ -925,10 +973,14 @@ if run:
             st.stop()
         pdf_path = str(DEMO_DIR / "paper.pdf")
         code_path = str(DEMO_DIR / "project.zip")
+        # 演示数据也要给出**输入字节**：T2 的会话指纹（_session_lookup）只认字节，
+        # 用 pdf_bytes/code_bytes 两个名字。这一段曾漏掉，导致"默认开关＝演示数据"
+        # 一点按钮就 NameError（上传路径有这两个变量、演示分支没有）。
+        pdf_bytes = (DEMO_DIR / "paper.pdf").read_bytes()
+        code_bytes = (DEMO_DIR / "project.zip").read_bytes()
         user_results = json.loads((DEMO_DIR / "results.json").read_text(encoding="utf-8"))
-        fingerprint = hashlib.sha1(
-            (DEMO_DIR / "paper.pdf").read_bytes()
-            + (DEMO_DIR / "project.zip").read_bytes()).hexdigest()[:10]
+        fingerprint = hashlib.sha1(pdf_bytes + code_bytes).hexdigest()[:10]
+        session_fp = fingerprint
         meta = {"source": "内置演示数据(受控样例)",
                 "files": "demo/paper.pdf + demo/project.zip + demo/results.json",
                 "fingerprint": fingerprint}
@@ -936,28 +988,81 @@ if run:
         st.warning("请上传论文 PDF（代码 ZIP 可选），或打开演示数据开关")
         st.stop()
 
+    # ---- T1: 新会话进入先清(只做一次——首次点击时)。
+    #      后续同会话点击不再清库, 否则 T2 的索引会被自己清掉。
+    _cleared = _session_clear()
+    if _cleared is None:
+        # 会话存储不可用(降级路径): 退回逐轮清理, 行为与改造前一致
+        _purge = _purge_run_state(st.session_state.pop("_tmp_uploads", None) or [])
+    else:
+        # 会话内: 不清运行缓存(要让指纹命中生效), 只留痕上传临时文件
+        _purge = _purge_run_state(st.session_state.pop("_tmp_uploads", None) or [],
+                                  force=False)
+
+    # ---- T2: 查输入指纹的状态(每次运行前都查, 不清库)。
+    #      返回 needs_index 告诉后面"要不要重解析";
+    #      若同会话内已解析过, snapshot 里给出复用产物, 跳过 PDF 解析与代码扫描。
+    _init = _session_lookup(pdf_bytes, code_bytes)
+
+    for _stale in ("audit", "report", "meta", "clar_done"):
+        st.session_state.pop(_stale, None)
+
     bar = st.progress(0, text="准备中…")
 
     def on_progress(i: int, name: str):
         bar.progress(int((i + 1) / len(STEPS) * 100), text=f"✅ {name}")
 
-    audit, report_md = run_audit(pdf_path, code_path, user_results,
-                                 api_key=api_key or None, progress=on_progress,
-                                 # 模型 API 的端点与模型名（页面可填，任意 OpenAI 兼容模型）
-                                 llm_base_url=(llm_base_url or "").strip(),
-                                 llm_model=(llm_model or "").strip(),
-                                 # 读图用**已判定过的生效值**：单模态时是②里成对填的视觉配置，
-                                 # 多模态时是①的模型 API 本身（_vision_from_llm）。
-                                 # 直接用原始输入框会让"只填了 key 没填 URL"也偷偷生效。
-                                 vision_key=_vk_eff,
-                                 vision_base_url=_vu_eff,
-                                 vision_model=_vm_eff,
-                                 vision_source=("复用模型 API（多模态）" if _vision_from_llm
-                                                else ""),
-                                 vision_max_regions=int(vision_max_regions),
-                                 vision_budget_seconds=float(vision_budget),
-                                 plan_mode=use_planner,
-                                 llm_planner=_AI_ON, llm_patch=_AI_ON)
+    _audit_kwargs = dict(
+        api_key=api_key or None, progress=on_progress,
+        # 模型 API 的端点与模型名（页面可填，任意 OpenAI 兼容模型）
+        llm_base_url=(llm_base_url or "").strip(),
+        llm_model=(llm_model or "").strip(),
+        # 读图用**已判定过的生效值**：单模态时是②里成对填的视觉配置，
+        # 多模态时是①的模型 API 本身（_vision_from_llm）。
+        # 直接用原始输入框会让"只填了 key 没填 URL"也偷偷生效。
+        vision_key=_vk_eff,
+        vision_base_url=_vu_eff,
+        vision_model=_vm_eff,
+        vision_source=("复用模型 API（多模态）" if _vision_from_llm else ""),
+        vision_max_regions=int(vision_max_regions),
+        vision_budget_seconds=float(vision_budget),
+        plan_mode=use_planner,
+        llm_planner=_AI_ON, llm_patch=_AI_ON,
+        # 会话级复用(阶段三第1步): 同会话内第二次跑, 跳过解析
+        needs_index=_init.get("needs_index") if _init else None,
+        snapshot=_init.get("snapshot") if _init else None,
+        # 快照键: 与 session.fingerprint 同源(论文+代码)
+        session_fp=session_fp)
+
+    if use_multagent:
+        # 多智能体版（阶段四）: 与经典版同源签名，差别只在"参数比对"那段换成对撞区。
+        # 依赖 langgraph —— **装不上/调用失败就回落经典版并如实说明**，
+        # 绝不让整个页面因为一个可选能力崩掉。
+        try:
+            from paper2lab.graph import run_audit_multagent
+            # 图版把视觉参数打包成 vision_kwargs（与 pipeline 内部构造同源）
+            _mk = dict(_audit_kwargs)
+            _mk["vision_kwargs"] = {
+                "api_key": _vk_eff, "base_url": _vu_eff, "model": _vm_eff,
+                "source_hint": ("复用模型 API（多模态）" if _vision_from_llm else ""),
+                "budget_seconds": float(vision_budget)}
+            _mk["vision_max_regions"] = int(vision_max_regions)
+            # 对撞区角色是否用模型（默认关）。经典版 run_audit 不认识这个参数，
+            # 所以只能加在这条分支上，不能放进上面共用的 _audit_kwargs。
+            _mk["role_llm"] = bool(use_role_llm)
+            for _drop in ("vision_key", "vision_base_url", "vision_model",
+                          "vision_source", "vision_budget_seconds", "plan_mode"):
+                _mk.pop(_drop, None)
+            audit, report_md = run_audit_multagent(pdf_path, code_path,
+                                                   user_results, **_mk)
+        except Exception as _mex:      # noqa: BLE001
+            st.warning(f"多智能体模式不可用（{type(_mex).__name__}: {_mex}），"
+                       "已自动回落经典模式——结论口径不变，只是没有对撞区留痕。")
+            audit, report_md = run_audit(pdf_path, code_path, user_results,
+                                         **_audit_kwargs)
+    else:
+        audit, report_md = run_audit(pdf_path, code_path, user_results,
+                                     **_audit_kwargs)
     bar.empty()
     st.session_state["audit"] = audit
     st.session_state["report"] = report_md
@@ -1056,6 +1161,105 @@ if "audit" in st.session_state:
                 st.caption(f"· {_n}")
             st.caption(f"{len(STEPS)} 环节 / {len(TOOLS)} 工具"
                        "（参数归一化 · 交叉匹配 · 结果核验 合为一个工具）")
+
+    # ---- 第三期: 多智能体对撞区（只有走图版审计时才有数据，经典版自动不显示）
+    _recs = _ex.get("records") or []
+    _ROLE_KEYS = ("roles", "collider", "arbiter", "redteam", "report_findings")
+    if any((r or {}).get("key") in _ROLE_KEYS for r in _recs):
+        _role_recs = [r for r in _recs if (r or {}).get("key") in _ROLE_KEYS]
+        _cc = _ex.get("crosscheck") or []
+        _agree = sum(1 for x in _cc if (x or {}).get("verdict") == "互证")
+        _diffs = [x for x in _cc if (x or {}).get("verdict") == "分歧"]
+        _only_c = [x for x in _cc if (x or {}).get("verdict") == "仅对撞"]
+        _head = (f"🧬 多智能体对撞区（三方独立抽取 → 对撞 → 仲裁 → 红队 · "
+                 f"互证 {_agree} / 分歧 {len(_diffs)}")
+        if _only_c:
+            _head += f" / 对撞新增 {len(_only_c)}"
+        # 有分歧时默认展开 —— 分歧是这条流水线最该被看见的输出；
+        # 全互证时折叠，不占版面（结论已被 align 基线代表）。
+        with st.expander(_head + "）", expanded=bool(_diffs)):
+            st.caption(
+                "三个角色各只看自己该看的材料——隔离在代码层面强制（读不到对方的字段），"
+                "不是靠提示词求它别看。对撞与仲裁是纯规则、不调模型，所以可复现、可做消融对照。")
+            # 关键结论用纯文本再说一遍：表格是画布渲染，读屏/复制/测试都取不到文字，
+            # 而"分歧了哪几个参数"恰恰是这块最该被一眼看到的输出。
+            if _diffs:
+                st.warning("⚠️ 分歧参数：" + "、".join(
+                    str(x.get("param_key")) for x in _diffs)
+                    + "　—— 两条独立路径给出了不同结论，已如实并列保留，未做静默合并。")
+            elif _cc:
+                st.success("两条独立路径（align 基线 / 对撞区）结论一致，结论被互证。")
+            st.markdown("**角色执行留痕**")
+            st.dataframe(
+                [{"角色": {"roles": "解析员 / 代码验证员 / 数值验证员",
+                           "collider": "对撞（并排比对）",
+                           "arbiter": "仲裁（按证据强度裁决）",
+                           "redteam": "红队（专挑漏洞）",
+                           "report_findings": "双路核对"}.get(r["key"], r["key"]),
+                  "结果": {"done": "✅ 完成", "skipped": "⏭️ 闸门拦住",
+                           "failed": "❌ 失败"}.get(r["status"], r["status"]),
+                  "说明": r.get("reason") or "—",
+                  "闸门": r.get("gate") or "—",
+                  "耗时": f"{r.get('seconds', 0)}s"}
+                 for r in _role_recs],
+                use_container_width=True, hide_index=True)
+
+            if _cc:
+                st.markdown("**双路核对：align 基线 vs 对撞区独立结论**")
+                st.caption(
+                    "这是两条互相独立的推理路径：align（参数归一化+交叉匹配）与对撞区"
+                    "（三方角色独立抽取）。两边都对上＝结论被互证；对不上＝**分歧本身也是发现**，"
+                    "如实列出而不是让后跑的那条静默覆盖。")
+                st.dataframe(
+                    [{"参数": x.get("param_key"),
+                      "核对结果": {"互证": "🤝 互证", "分歧": "⚠️ 分歧",
+                                   "仅基线": "基线独有", "仅对撞": "对撞独有"
+                                   }.get(x.get("verdict"), x.get("verdict")),
+                      "基线（align）": {"consistent": "一致", "inconsistent": "不一致",
+                                        "missing_in_code": "代码未找到",
+                                        "missing_in_paper": "论文未声明",
+                                        "not_fixed": "未固定",
+                                        "unverifiable": "无法静态核验",
+                                        "internal_inconsistent": "内部矛盾"
+                                        }.get(x.get("baseline"), x.get("baseline") or "—"),
+                      "对撞区": {"consistent": "一致", "inconsistent": "不一致",
+                                 "missing_in_code": "代码未找到",
+                                 "missing_in_paper": "论文未声明",
+                                 "not_fixed": "未固定",
+                                 "unverifiable": "无法静态核验",
+                                 "internal_inconsistent": "内部矛盾"
+                                 }.get(x.get("collision"), x.get("collision") or "—")}
+                     for x in _cc],
+                    use_container_width=True, hide_index=True)
+
+            _arb = _ex.get("arbitrations") or []
+            if _arb:
+                st.markdown("**仲裁裁决（按证据强度，不是简单投票）**")
+                st.dataframe(
+                    [{"参数": a.get("param_key"),
+                      "裁决": {"维持冲突": "⚠️ 维持冲突", "降级为疑似": "🔸 降级为疑似",
+                               "撤销冲突": "✅ 撤销冲突", "升级": "🚨 升级"
+                               }.get(a.get("verdict"), a.get("verdict")),
+                      "理由": a.get("reason") or "—",
+                      "置信": {"confirmed": "已确认", "inferred": "疑似"
+                               }.get(a.get("confidence"), a.get("confidence") or "—"),
+                      "需人工确认": "是" if a.get("requires_human") else "否"}
+                     for a in _arb],
+                    use_container_width=True, hide_index=True)
+
+            _rt = _ex.get("red_team") or []
+            if _rt:
+                st.markdown("**红队笔记（对抗式验证，专挑结论漏洞）**")
+                st.caption("挑漏洞的维度全部是程序能查的（证据缺出处 / 单侧定案 / 数值离谱 / "
+                           "同义词未归并 / 置信不足），不是模型\"觉得\"。")
+                st.dataframe(
+                    [{"参数": n.get("param_key"),
+                      "漏洞类型": n.get("flaw") or "—",
+                      "严重度": {"high": "🔴 高", "medium": "🟠 中",
+                                 "low": "🟡 低"}.get(n.get("severity"), n.get("severity") or "—"),
+                      "细节": n.get("detail") or "—"}
+                     for n in _rt],
+                    use_container_width=True, hide_index=True)
 
     # ---- 第二期第二批: 待确认问题（可直接填写答复, 答复只作为人工确认记录）
     try:

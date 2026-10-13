@@ -91,6 +91,27 @@ def run_job(job: Job, *, progress: Optional[Callable[[int, str], None]] = None,
         except Exception:      # noqa: BLE001
             job.memory_lines = []
 
+    # 上下文装配器(阶段三第2步): 把会话级记忆按"论文侧 vs 代码侧"的对照结构
+    #   装进上下文, 让模型一眼对齐"论文说 1e-4, 代码写 1e-3",
+    #   而不是从两段混在一起的话里自己翻。纯函数, 在 make_plan 之前跑,
+    #   因此 planner 的 notes 里就能用上。
+    try:
+        from .session import get as _get_session
+        from .assembler import assemble
+        _store = _get_session()
+        if _store is not None:
+            recall = _store.recall(job.fingerprint)
+            job.context_screen = assemble(job, recall=recall)
+    except Exception:      # noqa: BLE001
+        job.context_screen = None
+
+    # 快路径(阶段三第1步): 同会话内同一套输入第二次跑, 解析产物已缓存,
+    #   直接复用, 不重复解析 PDF 也不重扫代码 AST。
+    #   解析是纯函数, 结论与重跑完全一致, 只省本地 CPU 时间。
+    if job.needs_index is False and job.snapshot is not None:
+        job.paper, job.code = job.snapshot
+        job.snapshot_reused = True
+
     plan = make_plan(job, plan_mode=plan_mode, use_llm=job.llm_planner)
     log = ExecutionLog(mode=plan.mode, notes=list(plan.notes),
                        plan=plan.to_dict())
@@ -151,4 +172,30 @@ def run_job(job: Job, *, progress: Optional[Callable[[int, str], None]] = None,
             remember(job.audit, job.fingerprint)
         except Exception:      # noqa: BLE001
             pass
+    # 会话级记忆(阶段三第2步): 把本次审计找到的证据写成线索, 供同一会话内
+    #   下次跑时按"论文侧 vs 代码侧"对照读出。
+    #   与 memory.remember 分工: 后者是跨会话的 JSON 线索摘要, 供提示用;
+    #   这里是会话内的结构化线索, 供装配器用。
+    if job.fingerprint and job.audit is not None:
+        _store_session_memory(job)
     return log
+
+
+def _store_session_memory(job: Job) -> None:
+    """把审计发现里的证据线索写入会话记忆（只写线索，不写结论）。"""
+    from .session import get as _get_session
+    store = _get_session()
+    if store is None:
+        return
+    fp = job.fingerprint
+    for f in job.audit.findings:
+        for channel, ev in (("paper", f.paper), ("code", f.code)):
+            if ev is None or getattr(ev, "context_excluded", False):
+                continue
+            value = getattr(ev, "raw_value", None) or getattr(ev, "snippet", "")
+            try:
+                store.store_memory(fp, f.param_key, str(value), channel,
+                                   getattr(ev, "location", ""),
+                                   getattr(ev, "snippet", ""))
+            except Exception:      # noqa: BLE001
+                pass
