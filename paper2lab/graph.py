@@ -137,6 +137,13 @@ class AuditGraphState(TypedDict):
     crosscheck: list                        # 双路核对表（基线 vs 对撞，见 node_report_findings）
     role_llm: bool                          # 对撞区角色是否用模型做规范化（**默认 False**）
     role_llm_note: str                      # 模型这次到底有没有参与（如实留痕，不静默）
+    # 阶段五（M2 闭环扩展）: 「搜 / 算 / 做」+ 迭代回边
+    loop_enabled: bool                      # 是否启用闭环扩展链（默认 False，不动既有路径）
+    loop_rounds: int                        # 迭代回边轮数上限（默认 3）
+    compute: dict                           # 「算」小规模复算与静态推演
+    citations: dict                         # 「搜」引证检索与核验
+    repro_plan: dict                        # 「做」复现方案 + 可复现性评级
+    loop_result: dict                       # 迭代回边留痕（逐轮推演记录）
     # 控制
     current_step: str                       # 当前节点 key
     next_step: str                          # 下一节点 key（由边的条件函数写）
@@ -184,6 +191,12 @@ _PRECONDITIONS = {
     # report_findings 只要求"两侧视图在"，不要求"有冲突" ——
     # 没有冲突时它仍要把（空的）结论写进 audit.findings，保持与经典版口径一致。
     "report_findings": {"views"},
+    # 阶段五（M2 闭环扩展）—— 同样必须登记，否则闸门形同虚设。
+    # 「算」「搜」都要有结论才谈得上复核；「做」要结论齐；迭代回边还要能读到代码。
+    "compute": {"findings"},
+    "search": {"findings"},
+    "repro_plan": {"findings"},
+    "loop": {"findings", "code"},
 }
 
 
@@ -221,6 +234,13 @@ def _have(state: AuditGraphState, name: str) -> bool:
         return bool(state.get("collisions"))
     if name == "arbitrations":
         return bool(state.get("arbitrations"))
+    # 阶段五（M2）
+    if name == "compute":
+        return bool(state.get("compute"))
+    if name == "citations":
+        return bool(state.get("citations"))
+    if name == "repro_plan":
+        return bool(state.get("repro_plan"))
     return False
 
 
@@ -434,6 +454,12 @@ def node_finalize(state: AuditGraphState) -> dict:
             # 对撞区角色有没有用模型 + 模型到底参没参与（默认 False，"没参与"也留痕）
             "role_llm": bool(state.get("role_llm")),
             "role_llm_note": state.get("role_llm_note", ""),
+            # 阶段五（M2 闭环）: 搜 / 算 / 做 + 迭代回边
+            "loop_enabled": bool(state.get("loop_enabled")),
+            "compute": state.get("compute", {}),
+            "citations": state.get("citations", {}),
+            "repro_plan": state.get("repro_plan", {}),
+            "loop": state.get("loop_result", {}),
         }
     state["current_step"] = "finalize"
     return dict(state, next_step=END)
@@ -625,9 +651,11 @@ def node_report_findings(state: AuditGraphState) -> dict:
         state["errors"].append(f"report_findings: {type(ex).__name__}: {ex}")
         state.setdefault("crosscheck", [])
         _record(state, "report_findings", "failed", str(ex), seconds=time.time() - t0)
-    # 对撞区与 align 都跑完了，交给下游自检/归因
-    state["next_step"] = "selfcheck"
-    return dict(state, next_step="selfcheck")
+    # 对撞区与 align 都跑完了，交给下游。
+    # 阶段五（闭环扩展）开着时先走「算 → 搜 → 做 → 迭代回边」，否则直接进自检。
+    _nxt = "compute" if state.get("loop_enabled") else "selfcheck"
+    state["next_step"] = _nxt
+    return dict(state, next_step=_nxt)
 
 
 def _ev(value: str, source: str, doc: str, channel: str) -> Optional[Evidence]:
@@ -635,6 +663,134 @@ def _ev(value: str, source: str, doc: str, channel: str) -> Optional[Evidence]:
     if not value:
         return None
     return Evidence(source=channel, location=source, snippet=doc[:120], raw_value=value)
+
+
+# ══════ 阶段五 · M2 闭环扩展（搜 / 算 / 做 + 迭代回边）══════
+#
+# 四个节点**全部是纯规则、零成本、离线可跑**（唯一可选的外部检索默认关闭），
+# 因此它们与对撞区一样：可复现、可做消融、不开 key 也能用。
+#
+# 为什么单独成一条链、而不是塞进 toolbox.TOOLS:
+#   TOOLS 决定进度条节点数（verify_graph 断言"工具数 == 10"，界面十步进度条也从它派生）。
+#   把新能力塞进 TOOLS 等于**改进度契约**，会让既有验证脚本与界面同时失真。
+#   所以它们与阶段四的 roles/collider 同等待遇: 新增节点、不占进度槽、只走条件边。
+
+def node_compute(state: AuditGraphState) -> dict:
+    """「算」: 小规模复算 + 静态推演（纯规则，不调模型、不执行用户代码）。"""
+    t0 = time.time()
+    try:
+        from .compute import review_numbers
+        audit = state.get("audit")
+        paper = state.get("paper")
+        code = state.get("code")
+        d = review_numbers(
+            findings=(getattr(audit, "findings", None) if audit is not None else None),
+            paper_params=(getattr(paper, "params", None) if paper is not None else None),
+            code_params=(getattr(code, "params", None) if code is not None else None),
+        )
+        state["compute"] = d
+        if audit is not None:
+            audit.compute = d
+        _record(state, "compute", "done",
+                reason=f"复算 {d.get('checked', 0)} 条 / 提示 {d.get('flagged', 0)} 条 / "
+                       f"未算 {d.get('skipped', 0)} 条",
+                seconds=time.time() - t0)
+    except Exception as ex:      # noqa: BLE001
+        state["errors"].append(f"compute: {type(ex).__name__}: {ex}")
+        state.setdefault("compute", {})
+        _record(state, "compute", "failed", str(ex), seconds=time.time() - t0)
+    state["next_step"] = "search"
+    return dict(state, next_step="search")
+
+
+def node_search(state: AuditGraphState) -> dict:
+    """「搜」: 论文内部检索 + 引证核验（本地零成本；外部文献检索默认关闭）。"""
+    t0 = time.time()
+    try:
+        from .retrieval import verify_citations
+        audit = state.get("audit")
+        rep = verify_citations(audit)
+        d = rep.to_dict()
+        state["citations"] = d
+        if audit is not None:
+            audit.citations = d
+        c = d.get("coverage") or {}
+        _record(state, "search", "done",
+                reason=f"引证覆盖 {c.get('cited', 0)}/{c.get('total', 0)}，"
+                       f"检索到段落 {c.get('with_retrieved', 0)} 条",
+                seconds=time.time() - t0)
+    except Exception as ex:      # noqa: BLE001
+        state["errors"].append(f"search: {type(ex).__name__}: {ex}")
+        state.setdefault("citations", {})
+        _record(state, "search", "failed", str(ex), seconds=time.time() - t0)
+    state["next_step"] = "repro_plan"
+    return dict(state, next_step="repro_plan")
+
+
+def node_repro_plan(state: AuditGraphState) -> dict:
+    """「做」: 复现方案 + 可复现性评级（规则算分，逐条给出扣分理由）。"""
+    t0 = time.time()
+    try:
+        from .repro_plan import build_repro_plan
+        audit = state.get("audit")
+        plan = build_repro_plan(audit, compute=state.get("compute"),
+                               citations=state.get("citations"),
+                               crosscheck=state.get("crosscheck"))
+        d = plan.to_dict()
+        d["markdown"] = plan.to_markdown()      # 供界面直接下载，无需二次渲染
+        state["repro_plan"] = d
+        if audit is not None:
+            audit.repro_plan = d
+            # 评级进 readiness（附加键，不动既有键，报告/界面都能取）
+            try:
+                audit.readiness["repro_grade"] = plan.grade
+            except Exception:      # noqa: BLE001
+                pass
+        g = d.get("grade") or {}
+        _record(state, "repro_plan", "done",
+                reason=f"可复现性评级 {g.get('level', '—')}（{g.get('score', '—')}/100），"
+                       f"扣分项 {len(g.get('deductions') or [])} 个",
+                seconds=time.time() - t0)
+    except Exception as ex:      # noqa: BLE001
+        state["errors"].append(f"repro_plan: {type(ex).__name__}: {ex}")
+        state.setdefault("repro_plan", {})
+        _record(state, "repro_plan", "failed", str(ex), seconds=time.time() - t0)
+    state["next_step"] = "loop"
+    return dict(state, next_step="loop")
+
+
+def node_loop(state: AuditGraphState) -> dict:
+    """迭代回边: 对不上 → 定位根因 → 修正 → 再验证，**有界 ≤3 轮**。
+
+    硬约束: 「修正」是**内存里的反事实推演**，绝不写文件、绝不改用户代码；
+    补丁草案沿用 patch.py 的"只生成不落盘"。
+    """
+    t0 = time.time()
+    g, reason = gate("loop", state)
+    if g != "pass":
+        _record(state, "loop", "skipped", reason, seconds=time.time() - t0, gate=g)
+        state["next_step"] = "selfcheck"
+        return dict(state, next_step="selfcheck")
+    try:
+        from .loop import run_loop
+        audit = state.get("audit")
+        rep = run_loop(audit, code_path=state.get("code_path", ""),
+                       max_rounds=int(state.get("loop_rounds") or 3))
+        d = rep.to_dict()
+        d["markdown"] = rep.to_markdown()
+        state["loop_result"] = d
+        if audit is not None:
+            audit.loop = d
+        _record(state, "loop", "done",
+                reason=f"{len(d.get('rounds') or [])} 轮内收敛 {d.get('resolved', 0)} 条，"
+                       f"升级人工确认 {len(d.get('unresolved') or [])} 条",
+                seconds=time.time() - t0)
+    except Exception as ex:      # noqa: BLE001
+        state["errors"].append(f"loop: {type(ex).__name__}: {ex}")
+        state.setdefault("loop_result", {})
+        _record(state, "loop", "failed", str(ex), seconds=time.time() - t0)
+    state["next_step"] = "selfcheck"
+    return dict(state, next_step="selfcheck")
 
 
 # ---------------------------------------------------------------- 图
@@ -686,14 +842,20 @@ def build_graph(*, multagent: bool = False) -> Any:
 
 def build_multagent_graph(*, checkpointer: Optional[Any] = None,
                           interrupt_before: Optional[list] = None,
-                          multagent: bool = True) -> Any:
-    """构建多智能体状态机（阶段四）。
+                          multagent: bool = True,
+                          loop: bool = False) -> Any:
+    """构建多智能体状态机（阶段四），可选挂上阶段五的闭环扩展链。
 
-    结构:
+    结构（multagent=True, loop=False）:
       start -> assemble_context -> plan -> parse_paper -> fill_missing ->
       analyze_images -> analyze_code -> roles -> collider -> arbiter ->
       redteam -> report_findings -> selfcheck -> llm_analyze -> rootcause ->
       patch -> report -> finalize
+
+    loop=True 时在 report_findings 与 selfcheck 之间插入阶段五的四个节点:
+      report_findings -> compute -> search -> repro_plan -> loop -> selfcheck
+    这四个节点是纯规则、零成本、离线可跑，**且不占进度槽**（与 roles/collider 同等
+    待遇），因此开关它不会改变界面进度口径，也不影响既有验证脚本。
 
     说明:
       - roles 是三 Agent 的入口: analyst / verifier / numeric 各写各的槽
@@ -701,8 +863,6 @@ def build_multagent_graph(*, checkpointer: Optional[Any] = None,
       - collider / arbiter / redteam 全部是纯规则、不调模型，因此可做消融对照。
       - report_findings 把仲裁后的冲突转成 Finding，交给下游 selfcheck /
         rootcause / patch / report 消费（它们只认 audit.findings）。
-      - align 被跳过了: 对撞口已经做了比对，再跑 align 会覆盖对撞结果。
-        所以 report_findings 直接指向 selfcheck。
       - 每个节点仍过闸门（_PRECONDITIONS），产物不齐就 blocked 并记录理由。
       - 失败不吞: 节点抛异常 -> 记入 state.errors -> 走到 finalize。
 
@@ -732,6 +892,13 @@ def build_multagent_graph(*, checkpointer: Optional[Any] = None,
         graph.add_node("redteam", node_redteam)
         graph.add_node("report_findings", node_report_findings)
 
+    if loop:
+        # 阶段五: 搜 / 算 / 做 + 迭代回边（纯规则，零成本）
+        graph.add_node("compute", node_compute)
+        graph.add_node("search", node_search)
+        graph.add_node("repro_plan", node_repro_plan)
+        graph.add_node("loop", node_loop)
+
     graph.add_node("finalize", node_finalize)
 
     # 边的规则（注意: 同一个节点绝不能同时加硬边和条件边，否则 LangGraph 当成两条
@@ -758,6 +925,9 @@ def build_multagent_graph(*, checkpointer: Optional[Any] = None,
         graph.add_conditional_edges("arbiter", _route)
         graph.add_conditional_edges("redteam", _route)
         graph.add_conditional_edges("report_findings", _route)
+    if loop:
+        for _k in ("compute", "search", "repro_plan", "loop"):
+            graph.add_conditional_edges(_k, _route)
     graph.add_conditional_edges("finalize", _route)
 
     graph.set_entry_point("start")
@@ -784,6 +954,8 @@ def run_audit_multagent(
     snapshot: Optional[tuple] = None,
     session_fp: str = "",
     role_llm: bool = False,
+    loop: bool = False,
+    loop_rounds: int = 3,
     thread_id: Optional[str] = None,
     interrupt_before: Optional[list] = None,
 ) -> tuple:
@@ -798,6 +970,11 @@ def run_audit_multagent(
                 （论文写"余弦退火"、代码写 CosineAnnealingLR -> 都归到 cosine）。
                 抽取/对撞/仲裁/红队全部不动，隔离也不破（只喂本侧材料）。
                 没 key / 调用失败一律回退规则版，并如实记在 role_llm_note 里。
+      loop: 是否启用阶段五（M2）的闭环扩展链（默认 False）:
+            「算」小规模复算 → 「搜」引证检索 → 「做」复现方案 + 可复现性评级
+            → 迭代回边（≤ loop_rounds 轮，内存反事实推演，绝不写文件）。
+            四个节点全是纯规则、零成本、离线可跑，不开 key 也能用。
+      loop_rounds: 迭代回边轮数上限（默认 3，硬上限 3 —— 有界自主防死循环）。
       thread_id: 传给 checkpoint（MemorySaver），缺省为本次输入的 hash，
                  这样同一次输入走同一个检查点，可续跑。
       interrupt_before: 在哪些节点执行前中断（如 ["collider"]），
@@ -827,10 +1004,14 @@ def run_audit_multagent(
         "paper_view": {}, "code_view": {}, "numeric_view": {},
         "collisions": [], "arbitrations": [], "red_team": [], "crosscheck": [],
         "role_llm": bool(role_llm), "role_llm_note": "",
+        # 阶段五（M2 闭环扩展）: 默认关 —— 不动既有路径与界面进度口径
+        "loop_enabled": bool(loop), "loop_rounds": int(loop_rounds),
+        "compute": {}, "citations": {}, "repro_plan": {}, "loop_result": {},
     }
     graph = build_multagent_graph(
         checkpointer=_make_checkpointer(),
         interrupt_before=interrupt_before,
+        loop=bool(loop),
     )
     config = {"configurable": {"thread_id": thread_id or _hash_state(state)}}
     final = state
@@ -871,6 +1052,14 @@ def _make_checkpointer() -> Any:
             ("paper2lab.models", "CodeInfo"),
             ("paper2lab.models", "Finding"),
             ("paper2lab.models", "AuditResult"),
+            # 下面四个是 Finding / AuditResult 的字段枚举（Status / Confidence /
+            # Risk / Category）。它们会随 state 一起进 checkpoint；漏登记时
+            # langgraph 目前只告警并把枚举降级成普通值 —— 续跑会把它们还原成
+            # 字符串，且未来版本会直接拒绝反序列化。故一并登记，把坑提前填掉。
+            ("paper2lab.models", "Status"),
+            ("paper2lab.models", "Confidence"),
+            ("paper2lab.models", "Risk"),
+            ("paper2lab.models", "Category"),
             ("paper2lab.assembler", "ContextScreen"),
             ("paper2lab.assembler", "AlignedParam"),
             ("paper2lab.assembler", "MemorySide"),

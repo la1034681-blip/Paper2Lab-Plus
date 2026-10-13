@@ -207,6 +207,12 @@ class AuditResult:
     # 报告与界面只拿得到 audit, 否则这两件事永远是"报告之外的独立脚本动作"。
     rootcause: list = field(default_factory=list)   # List[TraceResult]
     patches: list = field(default_factory=list)     # List[PatchProposal]
+    # 阶段五（M2 闭环扩展）: 「搜 / 算 / 做」+ 迭代回边的产物。
+    # 同样是"报告与界面只拿得到 audit"这个理由 —— 挂在 AuditResult 上才看得见。
+    compute: dict = field(default_factory=dict)     # 「算」小规模复算与静态推演
+    citations: dict = field(default_factory=dict)   # 「搜」引证检索与核验
+    repro_plan: dict = field(default_factory=dict)  # 「做」复现方案 + 可复现性评级
+    loop: dict = field(default_factory=dict)        # 迭代回边留痕（逐轮推演记录）
 
     def to_json(self) -> str:
         return json.dumps(

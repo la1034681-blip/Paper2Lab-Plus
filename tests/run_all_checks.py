@@ -87,6 +87,16 @@ CHECKS: list[tuple[str, list[str], int]] = [
     # 真机断言两件事: ① 开关打开页面时就是开的；② 执行记录里确实走了 AI 排计划
     # （若 AI 不可用，必须**如实说明已回退规则版**，不许悄悄退回还说自己是 AI 排的）。
     ("网页端默认 agent 模式",       ["tests/verify_agent_default.py"], 600),
+    # 阶段五（M2 闭环扩展）: 「搜 / 算 / 做」+ 迭代回边。四个模块全是纯规则、
+    # 零成本、离线可跑，所以必须进全套回归——否则"不开 key 也能用的能力"反而没人守。
+    # 其中 verify_loop.py 带一条硬自检: 跑完**代码包哈希必须一字不变**（反事实推演）。
+    ("「算」小规模复算与静态推演",   ["tests/verify_compute.py"], 300),
+    ("「搜」引证检索与核验",        ["tests/verify_retrieval.py"], 300),
+    ("「做」复现方案与可复现性评级", ["tests/verify_repro_plan.py"], 300),
+    ("迭代回边 有界且绝不落盘",      ["tests/verify_loop.py"], 300),
+    # 端到端: 挂上闭环链后跑真实 demo，做 classic / multagent / multagent+loop 三方
+    # 消融对照 —— 「只加能力、不改结论」这条保证必须有对照证据，不能只靠承诺。
+    ("阶段五 闭环端到端与消融",      ["tests/verify_closeloop.py"], 600),
 ]
 
 ERR_PAT = ("Traceback", "❌", "异常", "未通过", "Error", "error", "ERR:",

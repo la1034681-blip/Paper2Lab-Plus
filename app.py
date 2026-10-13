@@ -735,6 +735,33 @@ use_multagent = st.toggle(
          "所以打开它不改结论，只是多一层独立验证和一组留痕。\n\n"
          "需要额外依赖 langgraph；若当前环境装不上，会自动回落经典版并提示。")
 
+# 🔁 复现闭环（阶段五 · M2）: 「搜」（引证检索与核验）/「算」（小规模复算与静态推演）/
+# 「做」（复现方案 + 可复现性评级）+ 迭代回边（对不上 → 定根因 → 修正 → 再验证，≤3 轮）。
+# **默认关闭**，与多智能体同理: 新能力默认关 = 经典路径不受影响。
+# 关键: 这四个环节**全是纯规则、零成本、离线可跑**，不开 key 也能用 ——
+# 所以它不像「角色用模型」那样要花钱，唯一的成本是几十毫秒和一点点篇幅。
+# 它挂在多智能体调度的对撞区之后（report_findings → compute → search → repro_plan → loop），
+# 所以打开它会**自动带起多智能体**；这里如实提示，不悄悄替用户改设定。
+use_closeloop = st.toggle(
+    "🔁 复现闭环（搜 / 算 / 做 + 迭代回边，默认关）", value=False,
+    help="在审计结论之上补三步，并把它们串成一个有界闭环：\n\n"
+         "**搜** —— 为每条结论从论文原文检索最相关的段落贴在旁边，并统计"
+         "「这条有没有可定位出处」；外部文献检索默认关闭（零成本）。\n\n"
+         "**算** —— 小规模复算 + 静态推演：把已知的数代进已知公式核对"
+         "（比如论文写 warmup=1000 步、代码写 warmup_ratio=0.05，总步数 20000 时"
+         "其实是一回事）。**不执行任何训练、不运行你的代码**；跑不动的一律标"
+         "「需实机验证」，算不出来就说算不出来，不用默认值补数。\n\n"
+         "**做** —— 产出可执行的复现方案（环境 / 数据 / 有序步骤 / 参数表）+ "
+         "**可复现性评级 A/B/C/D**（规则算分，每条扣分理由都写出来）。\n\n"
+         "**迭代回边** —— 对不上 → 定位根因 → 提出修正 → 再验证，最多 3 轮，"
+         "任何一轮没有改善就停止。所谓「修正」是**内存里的推演**，"
+         "**不写任何文件、不改你的代码**；三轮后仍未收敛的升级为「待人工确认项」。\n\n"
+         "打开后会自动启用上面的「多智能体对撞」——闭环链挂在对撞区之后。")
+if use_closeloop and not use_multagent:
+    use_multagent = True
+    st.caption("已自动启用「🧬 多智能体对撞」——复现闭环挂在对撞区之后，"
+               "对撞结论是它的输入。")
+
 # 🧠 对撞区角色用模型（**默认关**）: 让三个角色各自把本侧的值**规范化**成可比对的标记
 # （论文写"余弦退火"、代码写 CosineAnnealingLR → 两边都归到 cosine）。
 # 为什么默认关: ① 线上成本必须严格为零（这是有意配置，不是漏配）；
@@ -1050,6 +1077,10 @@ if run:
             # 对撞区角色是否用模型（默认关）。经典版 run_audit 不认识这个参数，
             # 所以只能加在这条分支上，不能放进上面共用的 _audit_kwargs。
             _mk["role_llm"] = bool(use_role_llm)
+            # 阶段五（M2 闭环扩展）: 搜 / 算 / 做 + 迭代回边（默认关，纯规则零成本）。
+            # 同样不能放进 _audit_kwargs —— run_audit 不认识这两个参数会 TypeError。
+            _mk["loop"] = bool(use_closeloop)
+            _mk["loop_rounds"] = 3
             for _drop in ("vision_key", "vision_base_url", "vision_model",
                           "vision_source", "vision_budget_seconds", "plan_mode"):
                 _mk.pop(_drop, None)
@@ -1260,6 +1291,164 @@ if "audit" in st.session_state:
                       "细节": n.get("detail") or "—"}
                      for n in _rt],
                     use_container_width=True, hide_index=True)
+
+    # ---- 阶段五（M2 闭环扩展）: 搜 / 算 / 做 + 迭代回边
+    # 只有走闭环链时才有数据（经典版与纯多智能体版都不显示），自动判断、不空占版面。
+    _cmp = _ex.get("compute") or {}
+    _cit = _ex.get("citations") or {}
+    _rpl = _ex.get("repro_plan") or {}
+    _lp = _ex.get("loop") or {}
+    if _cmp or _cit or _rpl or _lp:
+        _grade = (_rpl.get("grade") or {})
+        _lvl = _grade.get("level") or "—"
+        _unres = _lp.get("unresolved") or []
+        # 有"待人工确认项"或评分离及格线近时默认展开
+        _head = (f"🔁 复现闭环（搜 / 算 / 做 + 迭代回边）"
+                 f" · 可复现性 **{_lvl}（{_grade.get('score', '—')}/100）**")
+        if _unres:
+            _head += f" · 待人工确认 {len(_unres)} 项"
+        with st.expander(_head, expanded=bool(_unres)):
+            st.caption(
+                "这一段的四个环节**全是程序规则、不调模型、离线可跑**：不开 API key 也能用，"
+                "同一份材料永远得出同一个结果。「算」只做小规模复算与静态推演，"
+                "**不执行任何训练、不运行你的代码**；「迭代回边」里的「修正」是内存里的推演，"
+                "**不写任何文件、不改你的代码**。")
+
+            # ---- 关键结论先用文字说一遍（下面的表格是画布渲染，读屏/复制都取不到文字）
+            _rels = _cmp.get("relations") or []
+            _bad = [r for r in _rels if r.get("verdict") == "mismatch"]
+            _hint = [r for r in _rels if r.get("verdict") == "hint"]
+            _mag = _cmp.get("magnitudes") or []
+            _sum = []
+            if _rels:
+                _sum.append(f"「算」复算 {_cmp.get('checked', 0)} 条关系式"
+                            + (f"，其中 {len(_bad)} 条换算后仍对不上" if _bad else "")
+                            + (f"，{len(_hint)} 条给出推测性解释" if _hint else "")
+                            + (f"；{_cmp.get('skipped', 0)} 条因缺输入**未算**（不用默认值补数）"
+                               if _cmp.get("skipped") else ""))
+            if _mag:
+                _sum.append("「算」量纲提示：" + "、".join(
+                    f"{m.get('param')}（{m.get('detail', '')}）" for m in _mag[:3]))
+            _cov = _cit.get("coverage") or {}
+            if _cov:
+                _sum.append(f"「搜」引证覆盖 {_cov.get('cited', 0)}/{_cov.get('total', 0)}"
+                            f"（{(_cov.get('cited_ratio') or 0):.0%}）"
+                            + (f"，其中 {_cov.get('mismatched')} 条引文与原文不符"
+                               if _cov.get("mismatched") else ""))
+            if _rpl:
+                _sum.append(f"「做」可复现性评级 **{_lvl}**"
+                            f"（{_grade.get('score', '—')}/100，"
+                            f"{len(_grade.get('deductions') or [])} 条扣分理由）")
+            if _lp:
+                _sum.append(f"「迭代回边」{len(_lp.get('rounds') or [])} 轮内收敛 "
+                            f"{_lp.get('resolved', 0)} 条，"
+                            f"升级为待人工确认 {len(_unres)} 条")
+            if _sum:
+                st.info("　".join(_sum))
+            if _unres:
+                st.warning("⚠️ 三轮推演后仍未收敛（升级为**待人工确认项**，系统不硬凑）："
+                           + "、".join(str(u.get("display")) for u in _unres))
+
+            # ---- 算
+            if _rels or _cmp.get("plausibility"):
+                st.markdown("**「算」小规模复算与静态推演**")
+                st.caption("把已知的数代进已知公式核对。缺输入一律记「未算」——"
+                           "**不用默认值补出一个数**；带假设的推测标「需人工确认」，"
+                           "不与确定性结论混在一起。")
+                if _rels:
+                    _VL = {"consistent": "✅ 换算后一致", "mismatch": "⚠️ 复算对不上",
+                           "hint": "💡 推测（需人工确认）", "info": "ℹ️ 推演（不作为结论）",
+                           "skipped": "— 未算"}
+                    st.dataframe(
+                        [{"关系式": r.get("formula") or "—",
+                          "结论": _VL.get(r.get("verdict"), r.get("verdict") or "—"),
+                          "可信度": {"confirmed": "确凿", "inferred": "推测",
+                                     "none": "—"}.get(r.get("confidence"),
+                                                      r.get("confidence") or "—"),
+                          "说明": r.get("detail") or "—"}
+                         for r in _rels],
+                        use_container_width=True, hide_index=True)
+                for _p in (_cmp.get("plausibility") or []):
+                    st.caption(f"· 数值合理性：`{_p.get('param')}`（{_p.get('side')} 侧 "
+                               f"{_p.get('value')}）—— {_p.get('note')}")
+
+            # ---- 搜
+            if _cov:
+                st.markdown("**「搜」文献依据检索与引证核验**")
+                st.caption(f"检索方式：{_cit.get('mode', '字面检索')}。"
+                           "检索不到的如实记「未检索到」，不拿不相关段落充数。")
+                st.markdown(
+                    f"- 结论总数 **{_cov.get('total', 0)}**，其中 "
+                    f"**{_cov.get('cited', 0)}** 条有可定位出处"
+                    f"（论文页码 或 代码 file:line）\n"
+                    f"- 已检索到相关段落 **{_cov.get('with_retrieved', 0)}** 条\n"
+                    f"- 仅 AI 推断、无原文出处 **{_cov.get('inferred_only', 0)}** 条\n"
+                    f"- 引文与原文不符 **{_cov.get('mismatched', 0)}** 条")
+                _items = _cit.get("items") or []
+                _with = [it for it in _items if it.get("n_citations")]
+                if _with:
+                    st.dataframe(
+                        [{"参数": it.get("display") or it.get("param_key"),
+                          "一级出处": it.get("primary_source") or "—",
+                          "检索到的段落": (it["citations"][0].get("snippet") or "")[:110]}
+                         for it in _with[:12]],
+                        use_container_width=True, hide_index=True)
+                for _n in (_cit.get("notes") or [])[:3]:
+                    st.caption(f"· {_n}")
+
+            # ---- 做
+            if _rpl:
+                st.markdown("**「做」复现方案与可复现性评级**")
+                _deds = _grade.get("deductions") or []
+                if _deds:
+                    st.caption("扣分理由（每一条都可复核，改一处材料后重新生成，分数会跟着变）：")
+                    for _d in _deds[:10]:
+                        st.markdown(f"- −**{_d.get('points')}** {_d.get('reason')}")
+                _steps = _rpl.get("steps") or []
+                for _s in _steps:
+                    _flag = " **(必做)**" if _s.get("blocking") else ""
+                    st.markdown(f"**{_s.get('n')}. {_s.get('title')}**{_flag}")
+                    st.caption((_s.get("detail") or "")[:600])
+                if _rpl.get("markdown"):
+                    st.download_button(
+                        "⬇️ 下载完整复现方案（Markdown）",
+                        data=_rpl["markdown"].encode("utf-8"),
+                        file_name="REPRO_PLAN.md", mime="text/markdown",
+                        use_container_width=True,
+                        help="含环境 / 数据 / 有序步骤 / 参数对照表 / 评级与扣分理由 / 待确认事项")
+
+            # ---- 迭代回边
+            if _lp:
+                st.markdown("**「迭代回边」（对不上 → 定位根因 → 修正 → 再验证）**")
+                st.caption(f"有界自主：上限 {_lp.get('max_rounds', 3)} 轮，"
+                           "任何一轮没有改善就立即停止。「修正」是**内存里的反事实推演** ——"
+                           "不写任何文件、不改你的代码；补丁草案只生成不落盘。")
+                _rounds = _lp.get("rounds") or []
+                for _r in _rounds:
+                    st.markdown(f"**第 {_r.get('round')} 轮 · {_r.get('title')}**"
+                                f" —— 尝试 {_r.get('tried', 0)} 条，"
+                                f"收敛 {_r.get('improved', 0)} 条，"
+                                f"仍未解决 {_r.get('remaining', 0)} 条")
+                    _rows = []
+                    for _it in (_r.get("items") or []):
+                        _rows.append({
+                            "参数": _it.get("display"),
+                            "推演前": _it.get("before"),
+                            "推演后": _it.get("after"),
+                            "假设改成": _it.get("attempt") or "—",
+                            "位置": _it.get("target_loc") or "—",
+                            "结论": "✅ 收敛" if _it.get("resolved") else "· 未收敛",
+                            "说明": (_it.get("reason") or "")[:150],
+                        })
+                    if _rows:
+                        st.dataframe(_rows, use_container_width=True, hide_index=True)
+                if _lp.get("markdown"):
+                    st.download_button(
+                        "⬇️ 下载迭代推演留痕（Markdown）",
+                        data=_lp["markdown"].encode("utf-8"),
+                        file_name="ITERATION_TRACE.md", mime="text/markdown",
+                        use_container_width=True,
+                        help="逐轮的假设、复验结果与未收敛清单（含两侧原值）")
 
     # ---- 第二期第二批: 待确认问题（可直接填写答复, 答复只作为人工确认记录）
     try:
