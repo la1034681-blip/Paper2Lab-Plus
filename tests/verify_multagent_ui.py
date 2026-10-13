@@ -95,6 +95,13 @@ try:
                     page.wait_for_timeout(2500)
                 else:
                     say("  ! 没找到「多智能体对撞」开关")
+                # 打开多智能体后，它下面应多出一个子开关「对撞区角色用模型」（默认关）。
+                # 守的是"加了开关却没接线"：子开关只在多智能体分支渲染，
+                # 它出现了 = 页面这一侧确实按开关分流了。
+                page.wait_for_timeout(1200)
+                sub = page.locator("label").filter(has_text="对撞区角色用模型")
+                check(sub.count() >= 1,
+                      "多智能体打开后出现「对撞区角色用模型」子开关")
 
             page.get_by_text("开 始 科 研 审 计", exact=False).click()
             # 等目标文本（结果页标志），不用"等 body 变长"
