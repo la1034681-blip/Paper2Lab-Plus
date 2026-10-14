@@ -355,6 +355,34 @@ pillow>=10.0
 
 ---
 
+### 15. 评测打磨：自建审计考卷 + 契约对齐司南（SciEvalKit）
+
+前面所有验证都是**断言型**（该通过就通过）。但"抓错准不准、漏不漏、稳不稳"
+需要一个**可横向比较的刻度**。
+
+**接口用书生的、题目用自己的。** 书生的科学智能评测工具链是
+**SciEvalKit**（结果同步 OpenCompass 司南榜单）。它评的是"会不会做科研题"，
+榜单里没有"审计"这类任务 —— 所以：
+
+- **契约对齐**：`paper2lab/evalsuite/scieval_compat.py` 逐字复刻它的
+  `AgentBase / EvalSample / EvalResult / TrajectoryStore` 与 dataset 钩子
+  （`tests/verify_eval.py` **直接读官方源码**做签名比对），因此可被它的
+  `agent_runner.py` 直接拉起；
+- **自建考卷**：5 套真实 arXiv 论文 + 官方代码，另有演示样本、比赛数学建模题与诱饵样本，
+  期望项依据各论文**公开超参**人工整理 —— 不是从本工具输出抄的，避免自证；
+- **六项判分**：召回 / 精度 / F1 / 自证率，外加**诱饵误报**
+  （"合法差异"被误升级为高风险，是最伤信任的错）与**错位值拒收数**；
+- **零重依赖**：只用标准库，不拖 torch / vllm，可离线复现、零成本。
+
+```bat
+rem 三模式同跑对比（= 消融证据：只加能力、不改结论）
+.venv\Scripts\python.exe tools\run_eval.py --agent-mode classic,multagent,closeloop
+```
+
+口径说明与"挂进真 SciEvalKit 的三步"见 `docs/eval-spec.md`。
+
+---
+
 ## 四、系统架构
 
 ### 五层架构

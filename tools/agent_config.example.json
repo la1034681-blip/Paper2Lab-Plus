@@ -1,0 +1,9 @@
+{
+  "_说明": "挂进真 SciEvalKit 时的 agent_runner 配置样板（见 docs/eval-spec.md §6）。Paper2LabAgent 需按文档放进 scieval/agents/ 并登记 AGENT_MODULES。",
+  "agent": {
+    "class": "Paper2LabAgent",
+    "mode": "classic",
+    "force_mock": true
+  },
+  "data": ["Paper2Lab-AuditBench"]
+}

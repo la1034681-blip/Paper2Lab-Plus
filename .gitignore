@@ -34,6 +34,13 @@ deploy/
 Paper2Lab测试集/
 Paper2Lab测试集_v2/
 
+# 评测产物（tools/run_eval.py 输出，纯本地台账）
+eval_output/
+eval_output_test/
+
+# 界面回归脚本的启动日志（verify_keys_ui.py 产出，纯本地）
+_svc_keys_log.txt
+
 # 两个验证脚本的 stdout 重定向产物（verify_memory_capacity.py / verify_phase23.py
 # 把结果写到了工程根，纯本地台账，跟线上应用无关）
 _memc.txt

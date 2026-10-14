@@ -103,6 +103,9 @@ CHECKS: list[tuple[str, list[str], int]] = [
     # 前者还逐行断言 stdout 必须是合法 JSON-RPC（PyMuPDF 会污染它, 是踩过的坑）。
     ("协议化 MCP/SCP 封装",          ["tests/verify_mcp.py"], 600),
     ("协议化 Agent Skills 打包",     ["tests/verify_skill_pack.py"], 600),
+    # 阶段七·评测打磨: 契约与书生·司南 SciEvalKit 逐字对齐（直接读官方源码比对）,
+    # 判分四维 + 零重依赖自检; 端到端只跑 demo 一套（全量考卷见 tools/run_eval.py）。
+    ("阶段七 评测 契约对齐与判分",      ["tests/verify_eval.py"], 600),
 ]
 
 ERR_PAT = ("Traceback", "❌", "异常", "未通过", "Error", "error", "ERR:",
