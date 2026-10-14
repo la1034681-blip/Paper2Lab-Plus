@@ -1,0 +1,16 @@
+# MCP / SCP 通道的可选依赖（阶段六 · 协议化）。
+#
+# 为什么单独一个文件、不并进 requirements.txt:
+#   网页端（Streamlit）不需要它。并进去等于给线上每次构建多加一份依赖与
+#   一份供应链面，收益为零。装不上也不影响主程序 —— 本模块只在
+#   `python serve_mcp.py` 时才会被导入。
+#
+# 为什么钉 <2:
+#   mcp 2.x 把 FastMCP 改名成了 MCPServer 并调整了若干 API
+#   （https://py.sdk.modelcontextprotocol.io/v2/migration/）；
+#   端砚 SCP 的官方接入示例用的仍是 1.x 的 `streamablehttp_client`。
+#   与平台对齐的版本更省联调成本，升级时机见 paper2lab/mcp_server.py 顶部说明。
+#
+# 安装:
+#   .venv/Scripts/python.exe -m pip install -r requirements-mcp.txt
+mcp>=1.0,<2

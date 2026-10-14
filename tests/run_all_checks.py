@@ -97,6 +97,12 @@ CHECKS: list[tuple[str, list[str], int]] = [
     # 端到端: 挂上闭环链后跑真实 demo，做 classic / multagent / multagent+loop 三方
     # 消融对照 —— 「只加能力、不改结论」这条保证必须有对照证据，不能只靠承诺。
     ("阶段五 闭环端到端与消融",      ["tests/verify_closeloop.py"], 600),
+
+    # ---- 阶段六 协议化（2026-10-14）: MCP/SCP 封装 + Agent Skills 打包 ----
+    # verify_mcp.py 里有两条**真机**验证: stdio 握手 + Streamable HTTP 握手;
+    # 前者还逐行断言 stdout 必须是合法 JSON-RPC（PyMuPDF 会污染它, 是踩过的坑）。
+    ("协议化 MCP/SCP 封装",          ["tests/verify_mcp.py"], 600),
+    ("协议化 Agent Skills 打包",     ["tests/verify_skill_pack.py"], 600),
 ]
 
 ERR_PAT = ("Traceback", "❌", "异常", "未通过", "Error", "error", "ERR:",

@@ -19,6 +19,10 @@ _archive/
 .deploy/
 *.log
 
+# 技能包打包产物（tools/pack_skill.py 产出，属生成物）
+# 技能源文件本身在 skills/ 下，**要进仓库** —— 那是交付内容，不是产物
+dist/
+
 # deploy/ 是 make_deploy.py 生成的**上线裁剪包**（自带独立 .git 与远端）
 # 它是生成物、且内容与根目录重复，因此不进本仓库
 deploy/

@@ -1,0 +1,427 @@
+"""协议化① 验证：MCP / SCP 封装（阶段六）。
+
+关注点（每条都对应一个真实会错的地方）:
+1. **stdio 通道纯净性** —— stdout 是 JSON-RPC 专线，多一行脏数据客户端就断。
+   本轮实测踩过一次：PyMuPDF 有**两类**提示会写 stdout，一类在 import 时、
+   一类在第一次解析页面时，只挡一类不够。这条测试把它钉死。
+2. **封装不改结论** —— MCP 只是入口，审计仍由 pipeline / graph 实现。
+   因此同一输入经 MCP 拿到的结论，必须与直接调 pipeline 逐条一致。
+3. **失败要结构化** —— 路径不存在 / 模式非法 / 缺产物，都返回 ok=False 的 JSON，
+   而不是抛异常让调用方拿到栈。
+4. **只读** —— 跑一轮 MCP 调用前后，输入目录哈希一致。
+5. **返回值不灌爆上下文** —— 摘要必须裁剪，不回传 page_texts 这类大字段。
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from paper2lab import mcp_server as M  # noqa: E402
+
+DEMO = ROOT / "demo"
+PDF = str(DEMO / "paper.pdf")
+CODE = str(DEMO / "project.zip")
+SERVE = str(ROOT / "serve_mcp.py")
+
+CHECKS = 0
+FAILURES = []
+
+
+def check(ok, label):
+    global CHECKS
+    CHECKS += 1
+    # 防呆: 参数传反会让 ok 拿到非空字符串 -> 永远打印"通过"
+    assert isinstance(ok, bool), "[%s] ok 不是布尔值: %r" % (label, ok)
+    assert isinstance(label, str)
+    if not ok:
+        FAILURES.append(label)
+        print("  *x* " + label)
+    else:
+        print("  [ok] " + label)
+
+
+def sec(n):
+    print("\n" + "─" * 62)
+    print(n)
+    print("─" * 62)
+
+
+def snapshot(folder: Path) -> dict:
+    """目录快照（相对路径 -> 大小+修改时间），用于证明"全程只读"。"""
+    out = {}
+    for p in sorted(folder.rglob("*")):
+        if p.is_file():
+            st = p.stat()
+            out[str(p.relative_to(folder))] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def digest(d: dict) -> str:
+    return hashlib.sha1(json.dumps(d, sort_keys=True).encode()).hexdigest()[:12]
+
+
+# ═══════════════════════════════════════ 1. 输入校验
+
+sec("1. check_inputs —— 保守校验，宁可拒绝并说清原因")
+
+ok, why = M.check_inputs("", CODE)
+check(ok is False and "pdf_path" in why, "空论文路径 -> 拒绝并指出字段名")
+ok, why = M.check_inputs(PDF, "")
+check(ok is False and "code_path" in why, "空代码路径 -> 拒绝并指出字段名")
+ok, why = M.check_inputs(str(DEMO / "nope.pdf"), CODE)
+check(ok is False and "不存在" in why, "论文不存在 -> 拒绝并说明")
+ok, why = M.check_inputs(str(DEMO / "results.json"), CODE)
+check(ok is False and ".pdf" in why, "论文后缀不对 -> 拒绝并说明只收 pdf")
+ok, why = M.check_inputs(PDF, str(DEMO / "nope.zip"))
+check(ok is False and "不存在" in why, "代码包不存在 -> 拒绝并说明")
+ok, why = M.check_inputs(PDF, str(DEMO / "scan_paper.pdf"))
+check(ok is False, "代码路径给了个 .pdf -> 拒绝（不是目录也不是 zip）")
+ok, why = M.check_inputs(PDF, CODE)
+check(ok is True, "正例: pdf + zip -> 通过")
+ok, why = M.check_inputs(PDF, str(DEMO))
+check(ok is True, "正例: pdf + 已解压目录 -> 通过（开发机形态）")
+
+# ═══════════════════════════════════════ 2. 摘要裁剪
+
+sec("2. _shrink / _ev_brief —— 返回值必须够读、又不灌爆调用方上下文")
+
+long_s = "甲" * 500
+check(len(M._shrink(long_s, max_str=100)) < 120, "超长字符串被截断")
+check(M._shrink(42) == 42, "数字原样保留")
+check(M._shrink(None) is None, "None 原样保留")
+d = {str(i): i for i in range(20)}
+shrunk = M._shrink(d, max_items=5)
+check(len(shrunk) == 6 and "_more" in shrunk, "字典超项被裁剪并给出总数提示")
+lst = M._shrink(list(range(20)), max_items=5)
+check(len(lst) == 6 and isinstance(lst[-1], str), "列表超项被裁剪并给出总数提示")
+check(M._shrink({"a": {"b": {"c": {"d": 1}}}}, depth=2) is not None, "深层结构不炸")
+check(M._ev_brief(None) is None, "空证据 -> None")
+
+
+class _FakeEv:
+    raw_value = "1e-4"
+    normalized = 0.0001
+    location = "Page 3 · 4. Training Setup"
+    parser = "text"
+
+
+brief = M._ev_brief(_FakeEv())
+check(brief["value"] == "1e-4" and "Page 3" in brief["location"],
+      "证据压成「值 + 出处」且带解析通道")
+
+# ═══════════════════════════════════════ 3. 工具实现（离线纯函数）
+
+sec("3. 工具实现 —— 不依赖 mcp 包也能跑（纯函数层）")
+
+M.clear_cache()
+r = M.tool_list_pipeline_tools()
+check(r["ok"] is True, "list_pipeline_tools 返回 ok")
+check(len(r["pipeline_tools"]) == 10, "暴露 10 件流水线工具（与总纲口径一致）")
+check(r["steps_count"] == 12, "12 个进度节点（与主程序派生一致）")
+check(len(r["exposed_tools"]) == 7 and "audit_paper" in r["exposed_tools"],
+      "对外 7 个工具且含 audit_paper")
+
+snap_before = snapshot(DEMO)
+r = M.tool_audit_paper(PDF, CODE)
+check(r["ok"] is True, "audit_paper 跑通")
+check(r["findings_total"] == 11, "demo 得到 11 条结论")
+check(r["counts"].get("inconsistent") == 2, "其中 2 条不一致（与主程序口径一致）")
+check(r["cache"] == "miss", "首次调用 cache=miss")
+first = {f["param"]: (f["status"], (f["paper"] or {}).get("value"),
+                     (f["code"] or {}).get("value")) for f in r["findings"]}
+check(first["learning_rate"][0] == "inconsistent"
+      and first["learning_rate"][1] == "1e-4"
+      and first["learning_rate"][2] == "0.001",
+      "学习率 1e-4 vs 0.001 如实报出，两侧值都在")
+check(bool(r["findings"][0]["paper"]) and bool(r["findings"][0]["paper"]["location"]),
+      "每条结论带论文侧出处")
+check(r["findings"][0]["code"]["location"].count(":") == 1,
+      "代码侧出处是「文件:行号」")
+check("page_texts" not in json.dumps(r, ensure_ascii=False),
+      "摘要不含 page_texts 这类大字段")
+check(isinstance(r.get("report_preview"), str) and "include_report" in r.get("report_note", ""),
+      "默认只给报告预览并提示怎么拿全文")
+check(r["elapsed_s"] > 0, "耗时如实记录")
+
+r2 = M.tool_audit_paper(PDF, CODE)
+check(r2["cache"] == "hit", "同输入第二次命中进程内缓存")
+check(r2["findings_total"] == r["findings_total"], "缓存命中不改变结论")
+
+snap_after = snapshot(DEMO)
+check(digest(snap_before) == digest(snap_after),
+      "全程只读: demo 目录快照哈希前后一致")
+
+sec("3b. 六个入口的语义各不相同")
+
+r = M.tool_check_parameters(PDF, CODE)
+check(r["ok"] is True and r["mode"] == "classic", "check_parameters 走经典链")
+p = M.tool_audit_paper(PDF, CODE, mode="classic")
+check(r["findings_total"] == p["findings_total"], "check_parameters 与 audit_paper(classic) 同源")
+
+r = M.tool_audit_paper(PDF, CODE, mode="classic", closes_loop=True)
+check(r["ok"] is True and r["mode"] == "multagent",
+      "开闭环时自动切到多智能体链（与界面同一套语义）")
+
+r = M.tool_compute_verify(PDF, CODE)
+check(r["ok"] is True and "relations" in r, "compute_verify 返回关系式")
+check("不执行用户代码" in r.get("boundary", ""), "compute_verify 自带边界声明")
+
+r = M.tool_citation_check(PDF, CODE)
+check(r["ok"] is True and "coverage" in r, "citation_check 返回覆盖率")
+check("字面检索" in r.get("search_mode", ""), "检索方式自述为字面检索（不吹成语义检索）")
+check("未核验" in r.get("external_search", ""), "外部检索如实标注未启用/未核验")
+
+r = M.tool_build_repro_plan(PDF, CODE)
+check(r["ok"] is True and "steps" in r, "build_repro_plan 返回七步方案")
+check("85" in r.get("grade_scale", ""), "评级刻度写清")
+
+r = M.tool_iterate_fix(PDF, CODE)
+check(r["ok"] is True and "rounds" in r, "iterate_fix 返回逐轮留痕")
+check("不写文件" in r.get("boundary", ""), "迭代回边自带「不写文件」声明")
+
+sec("3c. 失败必须结构化返回，不能抛异常")
+
+r = M.tool_audit_paper("C:/definitely/not/here.pdf", CODE)
+check(r["ok"] is False and "不存在" in r["error"], "路径不存在 -> ok=False + 说明")
+r = M.tool_audit_paper(PDF, CODE, mode="turbo")
+check(r["ok"] is False and "classic" in r["error"], "mode 非法 -> ok=False + 说明")
+r = M.tool_audit_paper("", "")
+check(r["ok"] is False, "空参数 -> ok=False（不是异常）")
+for name in ("tool_compute_verify", "tool_citation_check",
+             "tool_build_repro_plan", "tool_iterate_fix"):
+    res = getattr(M, name)("C:/definitely/not/here.pdf", CODE)
+    check(res["ok"] is False and isinstance(res.get("error"), str),
+          f"{name} 坏输入 -> 结构化失败")
+
+# ═══════════════════════════════════════ 4. 与主程序同源
+
+sec("4. 与主程序同源 —— 封装不改结论（消融证据）")
+
+from paper2lab.pipeline import run_audit  # noqa: E402
+
+audit_direct, _report = run_audit(PDF, CODE, force_mock=True)
+direct_sig = sorted(
+    (f.param_key, f.status.value,
+     f.paper.raw_value if f.paper else "", f.code.raw_value if f.code else "")
+    for f in audit_direct.findings
+)
+M.clear_cache()
+via_mcp = M.tool_audit_paper(PDF, CODE, findings_limit=100)
+mcp_sig = sorted(
+    (f["param"], f["status"], (f["paper"] or {}).get("value") or "",
+     (f["code"] or {}).get("value") or "")
+    for f in via_mcp["findings"]
+)
+check(len(direct_sig) == len(mcp_sig), "两路结论条数一致")
+check(direct_sig == mcp_sig, "两路结论逐条一致（参数/状态/两侧值全同）")
+
+# ═══════════════════════════════════════ 5. FastMCP 绑定
+
+sec("5. FastMCP 绑定 —— 7 个工具、schema 正确")
+
+server = M.build_server()
+tools = asyncio.run(server.list_tools())
+names = [t.name for t in tools]
+check(len(names) == 7, "注册 7 个工具")
+check(sorted(names) == sorted(M.TOOL_NAMES), "工具名与 TOOL_NAMES 完全一致")
+schema = {t.name: t.inputSchema for t in tools}
+for t in tools:
+    req = (t.inputSchema or {}).get("required", [])
+    if t.name in ("list_pipeline_tools",):
+        check(req == [], "list_pipeline_tools 无需入参")
+    else:
+        check("pdf_path" in req and "code_path" in req,
+              f"{t.name} 的 schema 要求 pdf_path / code_path")
+ap_props = schema["audit_paper"]["properties"]
+check("closes_loop" in ap_props and "include_report" in ap_props,
+      "audit_paper 暴露闭环与报告开关（Schema 未被装饰器打乱）")
+check(ap_props["closes_loop"]["type"] == "boolean", "布尔参数类型正确")
+check(ap_props["findings_limit"]["type"] == "integer", "整数参数类型正确")
+
+# ═══════════════════════════════════════ 6. stdio 真机 + 通道纯净性
+
+sec("6. stdio 真机 —— 逐行都必须是合法 JSON-RPC（脏行会断连）")
+
+
+def probe_stdio():
+    """手动发请求、逐行校验。返回 (行清单, stderr 文本, 原始字节清单)。"""
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    proc = subprocess.Popen(
+        [sys.executable, "-u", SERVE],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        cwd=str(ROOT), env=env)
+    err_buf = []
+
+    def _drain():
+        for raw in proc.stderr:
+            err_buf.append(raw)
+    threading.Thread(target=_drain, daemon=True).start()
+
+    def send(obj):
+        proc.stdin.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+        proc.stdin.flush()
+
+    raws = []
+
+    def recv():
+        raw = proc.stdout.readline()
+        raws.append(raw)
+        return raw
+
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                         "clientInfo": {"name": "verify", "version": "1"}}})
+        recv()
+        send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        recv()
+        # 关键: 第 3、4 次调用才触发 PDF 解析 —— 脏行历来出现在这里
+        send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+              "params": {"name": "list_pipeline_tools", "arguments": {}}})
+        recv()
+        send({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+              "params": {"name": "check_parameters",
+                         "arguments": {"pdf_path": PDF, "code_path": CODE}}})
+        recv()
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+    return raws, b"".join(err_buf).decode("utf-8", "replace")
+
+
+raws, err_text = probe_stdio()
+check(len(raws) == 4, f"收到 4 行响应（实得 {len(raws)}）")
+
+bad = []
+for i, raw in enumerate(raws, 1):
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+        good = "jsonrpc" in obj and ("result" in obj or "error" in obj)
+    except Exception as exc:
+        good = False
+        obj = str(exc)
+    if not good:
+        bad.append((i, raw.decode("utf-8", "replace")[:80]))
+check(not bad, f"4 行全部是合法 JSON-RPC（脏行: {bad}）")
+
+first_obj = json.loads(raws[0].decode("utf-8"))
+check(first_obj["result"]["serverInfo"]["name"] == "paper2lab-audit",
+      "initialize 返回正确的服务名")
+tools_obj = json.loads(raws[1].decode("utf-8"))
+remote_names = [t["name"] for t in tools_obj["result"]["tools"]]
+check(sorted(remote_names) == sorted(M.TOOL_NAMES), "tools/list 远端看到 7 个工具")
+call3 = json.loads(raws[2].decode("utf-8"))
+check(call3["result"]["isError"] is False, "第 3 次调用 isError=False")
+payload = json.loads(call3["result"]["content"][0]["text"])
+check(len(payload["pipeline_tools"]) == 10, "远端拿到的流水线清单是 10 件")
+call4 = json.loads(raws[3].decode("utf-8"))
+res4 = json.loads(call4["result"]["content"][0]["text"])
+check(res4["ok"] is True and res4["findings_total"] == 11,
+      "远端跑真实审计也得 11 条结论")
+check("Processing request" in err_text or "transport=stdio" in err_text,
+      "服务端日志走 stderr（stdout 只留给 JSON-RPC）")
+
+# ═══════════════════════════════════════ 7. Streamable HTTP 真机
+
+sec("7. Streamable HTTP 真机 —— 端砚 SCP 的接入形态")
+
+PORT = 8791
+os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+os.environ["no_proxy"] = "127.0.0.1,localhost"
+
+http_proc = subprocess.Popen(
+    [sys.executable, "-u", SERVE, "--http", "--port", str(PORT)],
+    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    cwd=str(ROOT), env=dict(os.environ))
+http_err = []
+
+
+def _drain_http():
+    for raw in http_proc.stderr:
+        http_err.append(raw)
+
+
+threading.Thread(target=_drain_http, daemon=True).start()
+
+
+async def call_http(tool, arguments):
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+    url = f"http://127.0.0.1:{PORT}/mcp"
+    async with streamablehttp_client(url, timeout=10) as (r, w, _):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            tl = await s.list_tools()
+            res = await s.call_tool(tool, arguments)
+            return [t.name for t in tl.tools], res
+
+
+http_names, http_res = None, None
+last_err = ""
+for attempt in range(8):
+    try:
+        http_names, http_res = asyncio.run(
+            call_http("check_parameters", {"pdf_path": PDF, "code_path": CODE}))
+        break
+    except Exception as exc:
+        last_err = f"{type(exc).__name__}: {exc}"
+        time.sleep(1.0)
+
+if http_names is None:
+    check(False, f"HTTP 通道可连接（最后错误: {last_err[:120]}）")
+else:
+    check(sorted(http_names) == sorted(M.TOOL_NAMES),
+          "HTTP 通道也看到 7 个工具")
+    body = json.loads(http_res.content[0].text)
+    check(http_res.isError is False and body["ok"] is True,
+          "HTTP 通道调用返回 ok=True")
+    check(body["findings_total"] == 11, "HTTP 通道结论与 stdio 一致（11 条）")
+
+try:
+    http_proc.kill()
+    http_proc.wait(timeout=5)
+except Exception:
+    pass
+
+# ═══════════════════════════════════════ 8. 契约自述
+
+sec("8. 契约自述与版本口径")
+
+
+check(M.SERVER_NAME == "paper2lab-audit", "服务名固定")
+check(bool(M.SERVER_VERSION), "服务版本非空")
+check(len(M.TOOL_NAMES) == 7 and len(set(M.TOOL_NAMES)) == 7, "工具名无重复")
+check(len(M.STATUS_LABELS) == 7, "七种状态都有中文标签")
+check(all(k in M.STATUS_LABELS for k in
+          ("consistent", "inconsistent", "missing_in_code", "missing_in_paper",
+           "not_fixed", "unverifiable", "internal_inconsistent")),
+      "状态标签覆盖 models.Status 全部取值")
+check(M.CODE_SUFFIXES == (".zip",), "代码包只收 zip（目录走另一种分支）")
+check(callable(M.guarded) and callable(M.stdout_as_stderr),
+      "通道保护函数存在（这是本轮踩坑后加的防线）")
+
+print("\n" + "═" * 62)
+if FAILURES:
+    print(f"失败 {len(FAILURES)} / {CHECKS}")
+    for f in FAILURES:
+        print("  - " + f)
+    sys.exit(1)
+print(f"全部通过(verify_mcp.py): {CHECKS} 项")
