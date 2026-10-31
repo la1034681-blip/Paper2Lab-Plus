@@ -239,6 +239,143 @@ _ver = [m for m in ("torch", "vllm", "transformers", "tensorflow", "qwen_agent")
         if m in sys.modules]
 check(not _ver, f"导入 evalsuite 未拉起重依赖（实得 {_ver}）")
 
+# ═══════════════════════════════════════ 7. 三档消融（3C）
+
+sec("7. 三档消融 —— 只开解析员 / 加计算员 / 全开加审查员")
+
+from paper2lab.evalsuite.agent_adapter import (TIERS, TIER_BY_KEY,  # noqa: E402
+                                               tier_keys)
+from paper2lab.evalsuite.scoring import ALL_METRICS         # noqa: E402
+from paper2lab.runner import ABLATION_SKIP_REASON           # noqa: E402
+from paper2lab.toolbox import ABLATION_LOCKED, TOOL_BY_KEY  # noqa: E402
+
+# --- 7.1 档位表本身
+check(tier_keys() == ("parser", "calc", "review"), "三档就是三档，顺序即能力递增")
+for _a, _b in zip(TIERS, TIERS[1:]):
+    check(set(_a.metrics) <= set(_b.metrics),
+          f"档位 {_b.key} 的指标覆盖 {_a.key}（只能加、不能丢）")
+    check(set(_b.skip) <= set(_a.skip),
+          f"档位 {_b.key} 跳过的工具不多于 {_a.key}")
+check(len(TIER_BY_KEY["parser"].skip) == 3,
+      "档一只关三件：提假设 / 设计实验 / 自检（读与比是底座，三档都在）")
+_skip_all = set().union(*[set(t.skip) for t in TIERS])
+check(not (_skip_all & ABLATION_LOCKED),
+      "任何档位都不许跳受保护的底座（抽取 / 比对 / 报告）")
+
+# --- 7.2 档位与 agent 的绑定
+for _t in tier_keys():
+    _ag = Paper2LabAgent(mode="classic", tier=_t)
+    check(_ag.skip_tools == TIER_BY_KEY[_t].skip, f"档位 {_t} 的跳过清单与表一致")
+    check(_ag.model_version.endswith("classic") and _t in _ag.model_version,
+          f"档位 {_t} 写进 model_version（结果目录不串）")
+
+try:
+    Paper2LabAgent(mode="classic", tier="不存在的档")
+    check(False, "未知档位应报错")
+except ValueError:
+    check(True, "未知档位报错（不静默按全开跑）")
+
+try:
+    Paper2LabAgent(mode="multagent", tier="parser")
+    check(False, "档位配图版应报错")
+except ValueError:
+    check(True, "档位不给图版用（图版是硬边串起来的，逐件跳过会破图）")
+
+# --- 7.3 反事实：档位是**真跳过**，不是把输出藏起来
+from paper2lab import pipeline as _pl                       # noqa: E402
+
+_audit_skip, _ = _pl.run_audit(str(_samples[0].pdf), str(_samples[0].code),
+                              _samples[0].results or None, force_mock=True,
+                              skip_tools=("selfcheck",))
+_steps = {s["key"]: s for s in _audit_skip.execution_log.get("steps", [])}
+check(_steps.get("selfcheck", {}).get("status") == "skipped",
+      "自检这一件在执行记录里是 skipped（真没跑）")
+check(_steps.get("selfcheck", {}).get("reason") == ABLATION_SKIP_REASON,
+      "跳过理由统一标注（可核，不是悄悄少跑）")
+check(bool(_audit_skip.selfcheck.get("skipped")), "audit.selfcheck 标 skipped")
+check(all(f.verified is False or f.verified is True for f in _audit_skip.findings),
+      "档位跳过不篡改底层 findings（verified 原值留在审计对象上）")
+check(any("消融档位" in n for n in _audit_skip.execution_log.get("notes", [])),
+      "执行记录备注里写明本档未开哪些能力")
+
+try:
+    _pl.run_audit(str(_samples[0].pdf), str(_samples[0].code),
+                  _samples[0].results or None, force_mock=True,
+                  skip_tools=("align",))
+    check(False, "跳底座应报错")
+except AssertionError:
+    check(True, "跳受保护底座 → 当场断言失败（不出一份空答卷）")
+
+# --- 7.4 三档真跑（同一份 demo 考卷）
+_tier_sums = {}
+for _t in tier_keys():
+    _ds_t = AuditBenchDataset(_samples)
+    _tier_sums[_t] = run_agent_eval(
+        Paper2LabAgent(mode="classic", tier=_t), _ds_t,
+        work_dir=str(ROOT / "eval_output_test"))
+    _det = _ds_t.details.get(0, {})
+    _tier_sums[_t]["_det"] = _det
+
+_det_p = _tier_sums["parser"]["_det"]
+_det_c = _tier_sums["calc"]["_det"]
+_det_r = _tier_sums["review"]["_det"]
+
+check(_det_p.get("tier") == "parser" and _det_r.get("tier") == "review",
+      "作答里带档位标记（明细可追溯）")
+check((_det_p.get("stats") or {}).get("n_hypotheses", 0) == 0,
+      "档一：一张假设卡都没有（②站没开）")
+check((_det_p.get("stats") or {}).get("n_experiments", 0) == 0,
+      "档一：一张实验卡都没有")
+check((_det_c.get("stats") or {}).get("n_hypotheses", 0) > 0,
+      "档二：假设卡出来了（①站算过）")
+check((_det_c.get("stats") or {}).get("n_experiments", 0) > 0,
+      "档二：实验卡出来了（②站真跑过）")
+check((_det_c.get("stats") or {}).get("n_judged", 0) == 0,
+      "档二：一条都没判（③站没开）")
+check((_det_r.get("stats") or {}).get("n_judged", 0) > 0,
+      "档三：判定出来了（③站开了）")
+
+# 指标白名单：没开的能力不出数，且**绝不填 0**
+check("precision" not in _tier_sums["parser"], "档一不产出 precision（不是 0 分，是没测）")
+check("selfcheck_rate" not in _tier_sums["parser"], "档一不产出 selfcheck_rate")
+check("calc_coverage" not in _tier_sums["parser"], "档一不产出 calc_coverage")
+check("calc_coverage" in _tier_sums["calc"], "档二产出 calc_coverage（算了多少条）")
+check("precision" in _tier_sums["review"] and "selfcheck_rate" in _tier_sums["review"],
+      "档三才产出 precision / selfcheck_rate")
+
+# 只加能力、不改结论
+check(_tier_sums["parser"].get("recall") == _tier_sums["review"].get("recall"),
+      "三档召回一致：加能力不改结论")
+check(_tier_sums["parser"].get("decoy_fp") == _tier_sums["review"].get("decoy_fp"),
+      "三档诱饵误报一致：加能力不乱报")
+check(_tier_sums["parser"].get("n_findings") == _tier_sums["review"].get("n_findings"),
+      "三档结论条数一致")
+check(_tier_sums["calc"].get("calc_coverage", 0.0) > 0.0,
+      "档二确实算出了数（calc_coverage > 0）")
+check(_tier_sums["review"].get("judged", 0.0) > 0.0, "档三确实判了")
+
+# --- 7.5 判分器对白名单的处理（兼容旧作答）
+_legacy = {"found_params": {"paper": ["learning_rate"], "code": []},
+           "inconsistencies": [{"param_key": "learning_rate", "verified": True}],
+           "selfcheck": {"passed": 1, "checked": 1}}
+_ls = scoring.evaluate_answer(expect=["learning_rate"], decoy=[], answer=_legacy)
+check(_ls["precision"] == 1.0, "没声明白名单 → 按全量算（旧作答兼容）")
+
+_gated = dict(_legacy, metrics_available=["recall", "n_findings", "parse_ok"])
+_gs = scoring.evaluate_answer(expect=["learning_rate"], decoy=[], answer=_gated)
+check("precision" not in _gs, "声明不含 precision → 不产出 precision")
+check("selfcheck_rate" not in _gs, "声明不含 selfcheck_rate → 不产出")
+check(_gs["recall"] == 1.0, "声明含 recall → 照常产出")
+
+_unjudged = {"found_params": {"paper": ["learning_rate"], "code": []},
+             "inconsistencies": [{"param_key": "learning_rate", "verified": None}],
+             "selfcheck": {"passed": 0, "checked": 0, "skipped": True},
+             "metrics_available": list(ALL_METRICS)}
+_us = scoring.evaluate_answer(expect=["learning_rate"], decoy=[], answer=_unjudged)
+check(_us["precision"] == 0.0,
+      "verified=None 不算通过（未判 ≠ 判过；靠白名单不出数，而不是靠 0 分）")
+check(_us["judged"] == 0.0, "verified=None 不计入已判条数")
+
 # ═══════════════════════════════════════ 收尾
 
 print("\n" + "=" * 62)

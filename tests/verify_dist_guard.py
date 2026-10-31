@@ -12,8 +12,12 @@ from paper2lab.envfile import load_env
 from paper2lab.pipeline import run_audit
 
 load_env()
-HERE = Path(r"C:\Users\lijiahui\Desktop\比赛")
+# ⚠ 2026-10-29 修: 原来硬编码 `Desktop\比赛`。项目早已改名「兴智杯」，
+# 那个目录不再是被测项目 —— 结果落盘失败（PermissionError），八套审计白跑。
+HERE = Path(__file__).resolve().parent.parent
 ROOT = Path(r"C:\Users\lijiahui\Desktop\Paper2Lab测试集")
+_OUT = HERE / ".trash_tmp"          # 已 gitignore 的临时目录，不污染工作区
+_OUT.mkdir(exist_ok=True)
 
 out: list[str] = []
 out.append("=" * 72)
@@ -39,7 +43,7 @@ for name, pdf, code, res_path, real in CASES:
     ur = None
     if res_path is not None and Path(res_path).exists():
         ur = json.loads(Path(res_path).read_text(encoding="utf-8"))
-    a, _ = run_audit(str(pdf), str(code), ur, force_mock=not real, plan_mode=True)
+    a, _ = run_audit(str(pdf), str(code), ur, force_mock=not real)
     am = a.paper.agent_meta or {}
     filled = am.get("filled") or {}
     blocked = [s for s in (am.get("steps") or []) if s.get("status") == "rejected"]
@@ -71,5 +75,5 @@ for name, nf, ni, rd, filled, nb in rows:
     out.append(f"| {name} | {nf} | {ni} | {rd} | "
                f"{', '.join(f'{k}={v}' for k, v in filled.items()) or '—'} | {nb} |")
 
-(HERE / "_after_fix.txt").write_text("\n".join(out), encoding="utf-8")
+(_OUT / "_after_fix.txt").write_text("\n".join(out), encoding="utf-8")
 print("done")

@@ -22,7 +22,7 @@ from paper2lab.toolbox import Job                         # noqa: E402
 job = Job(pdf_path=str(HERE / "demo" / "paper.pdf"),
           code_path=str(HERE / "demo" / "project.zip"),
           api_key=key)
-base = _rule_plan(job, plan_mode=True)
+base = _rule_plan(job)
 prompt = _llm_prompt(job, base)
 print(f"prompt 长度 : {len(prompt)} 字符")
 print(f"prompt 尾部 : …{prompt[-160:]}")

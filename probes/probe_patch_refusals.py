@@ -70,7 +70,7 @@ def kind_of(reason: str) -> str:
 rows: list[dict] = []
 for name, pdf, zp, rj in CASES:
     res = json.loads(rj.read_text(encoding="utf-8")) if rj and rj.exists() else None
-    audit, _ = run_audit(str(pdf), str(zp), res, plan_mode=True)
+    audit, _ = run_audit(str(pdf), str(zp), res)
     traces = trace_findings(audit, max_items=8)
     patches = propose_patches(audit, traces, str(zp), max_items=8)
     n_ok = sum(1 for p in patches if p.is_proposed)

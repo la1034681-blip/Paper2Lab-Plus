@@ -15,7 +15,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PORT = 8514
 ROOT_SET = Path(r"C:\Users\lijiahui\Desktop\Paper2Lab测试集")
-OUT = ROOT / "_agent_ui.txt"
+_OUT_DIR = ROOT / ".trash_tmp"      # 验证产物落已 gitignore 的临时目录，不污染工作区
+_OUT_DIR.mkdir(exist_ok=True)
+OUT = _OUT_DIR / "_agent_ui.txt"
 log: list[str] = []
 
 
@@ -53,7 +55,7 @@ try:
             page = browser.new_page(viewport={"width": 1500, "height": 1200})
             errs: list[str] = []
             page.on("pageerror", lambda e: errs.append(str(e)))
-            page.goto(f"http://127.0.0.1:{PORT}", timeout=60000)
+            page.goto(f"http://127.0.0.1:{PORT}/?view=find", timeout=60000)
             page.wait_for_timeout(9000)
 
             if pdf is not None:
@@ -65,18 +67,24 @@ try:
                     page.wait_for_timeout(2000)
 
             page.get_by_text("开 始 科 研 审 计", exact=False).click()
-            for _ in range(45):
-                page.wait_for_timeout(2000)
-                if "综合复现就绪度" in page.inner_text("body"):
-                    break
-            page.wait_for_timeout(2500)
+            # ⚠ 2026-10-27：原来等的是「当前审计对象」——它在**侧栏提示**里也出现了，
+            #    于是一点按钮就立刻满足条件、在结果还没画完时就往下走，
+            #    接着去点「审计可信度」标签，标签页还没挂上 ⇒ 点空 ⇒ 面板读成 0 个。
+            #    （实测：demo 恒失败，PointNet / D题 因为跑得久反而蒙对。）
+            #    改等**标签条本身**：它只在出结果之后才存在，是这一步真正的到达条件。
+            page.wait_for_selector("[role=tab]", timeout=180000)
+            page.wait_for_timeout(3000)
 
             # 切到「审计可信度」页（抽取 Agent 面板在那里）
-            for t in page.locator("[role=tab]").all():
-                if "可信度" in t.inner_text():
-                    t.click()
+            # 同样要重试：结果页会重画几次，第一下点可能落在还没稳定的标签条上。
+            for _ in range(6):
+                for t in page.locator("[role=tab]").all():
+                    if "可信度" in (t.inner_text() or ""):
+                        t.click()
+                        break
+                page.wait_for_timeout(2500)
+                if "抽取 Agent" in page.inner_text("body"):
                     break
-            page.wait_for_timeout(2500)
 
             exp = page.locator("details").filter(has_text="抽取 Agent")
             say(f"  [{tag}] 匹配到 Agent 展开栏: {exp.count()}")

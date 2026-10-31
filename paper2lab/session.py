@@ -128,25 +128,40 @@ def fingerprint(pdf_bytes: bytes, code_bytes: bytes = b"") -> str:
 # ---------------------------------------------------------------- 单例管理器
 
 _stores: dict[str, "SessionStore"] = {}
-_current_id: str = ""
 _sweeper: Optional[threading.Thread] = None
 _sweep_stop = threading.Event()
+
+# 当前会话 id —— **线程局部**（2026-10-15 修，多用户隔离）。
+#
+# 为什么不能是进程级全局: `app.py` 挂在公网上是**一个进程服务所有访问者**。
+# 全局变量在单机单人时看不出任何问题, 一到多用户就串 ——
+# 用户 A 点过「开始科研审计」后全局 id = A 的会话; 用户 B 随后刷新页面,
+# 若这次脚本执行恰好落在同一个工作线程/或 B 这次没走到绑定分支, 就会读到 A 的 id,
+# 于是 B 在界面上看到 A 的会话记忆与轨迹（隐私级问题, 不是显示 bug）。
+#
+# 为什么用线程局部而不是"每次调用都从 streamlit 现取": 本模块**刻意不依赖 streamlit**
+# （CLI / MCP / 测试脚本也用它）, 所以真源在调用方; 而 Streamlit 的一次脚本执行是
+# 同一个线程里同步跑完的（实测同一次会话连点两次会换线程, 但单次执行不会中途换）,
+# 因此"每次脚本执行开头写一次、执行期间读"在线程局部上是自洽的。
+# 未绑定过的线程读到空串 → `get()` 返回 None → 走"无缓存"降级路径:
+# **宁可这次不缓存, 也绝不读到别人的会话**。
+_current = threading.local()
+
+
+def set_current_id(sid: str) -> None:
+    """把会话 id 绑到**当前线程**。约定由调用方在每个脚本/任务的入口处调用一次。"""
+    _current.sid = sid or ""
+
+
+def current_id() -> str:
+    """当前线程绑定的会话 id；未绑定返回空串（表示"无会话，存储不可用"）。"""
+    return getattr(_current, "sid", "")
+
 
 # 进程级快照缓存: 同会话内复用解析产物（paper/code 对象引用）。
 # 不走 JSON 存入 SQL，因为 Evidence 嵌套 + set 字段无法无损序列化。
 # T1 清库 + store.clear() 一起清空，保证与库内数据同步。
 _snapshot_cache: dict[str, dict] = {}
-
-
-def set_current_id(sid: str) -> None:
-    """由调用方（app.py）显式绑定当前会话 id。"""
-    global _current_id
-    _current_id = sid or ""
-
-
-def current_id() -> str:
-    """当前会话 id；未绑定时返回空串（表示"无会话，存储不可用"）。"""
-    return _current_id
 
 
 def _start_sweeper() -> None:
@@ -269,7 +284,19 @@ class SessionStore:
         with self._lock:
             if self._conn is None:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
-                self._conn = sqlite3.connect(str(self.path))
+                # check_same_thread=False: 连接**允许跨线程复用**（2026-10-15 修）。
+                # 为什么必须: Streamlit 的每次 rerun 都可能换工作线程 —— 实测同一次会话
+                # 里连点两次「开始科研审计」，两次分别落在 thread 20268 / 25372。
+                # 而会话存储是**按会话 id 缓存连接**的（见 _stores），于是第二次点击时
+                # close()/execute() 就落到"创建连接的那个线程"之外 —— sqlite3 默认
+                # check_same_thread=True 会直接抛
+                #   `SQLite objects created in a thread can only be used in that same
+                #    thread`，整页崩在 session_clear() 上（结果区连同标签页一起消失，
+                # 表现为"上传后等满 300s 不出结果"）。
+                # 安全性: Python 3.11+ 的 sqlite3 是 serialized 模式（threadsafety=3），
+                # 共享连接由 sqlite 内部互斥；且每个会话各自持有自己的连接，同会话内
+                # 脚本又是串行执行，不存在真并发写。
+                self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
                 self._conn.execute("PRAGMA journal_mode=WAL")
                 self._conn.execute("PRAGMA synchronous=NORMAL")
                 self._conn.execute("PRAGMA foreign_keys=ON")

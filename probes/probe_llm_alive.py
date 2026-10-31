@@ -41,7 +41,7 @@ from paper2lab.toolbox import Job                # noqa: E402
 job = Job(pdf_path=str(HERE / "demo" / "paper.pdf"),
           code_path=str(HERE / "demo" / "project.zip"),
           api_key=key)
-plan = make_plan(job, plan_mode=True, use_llm=True)
+plan = make_plan(job, use_llm=True)
 print(f"planner = {plan.planner}    （llm = AI 真的参与了；rule = 回退）")
 print(f"执行 {plan.to_dict()['ran']} 个 / 跳过 {plan.to_dict()['skipped']} 个")
 print("notes:")

@@ -236,6 +236,127 @@ _RESULT_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("silhouette", re.compile(rf"(?:silhouette|轮廓系数)\s*(?:coefficient|系数|score)?\s*(?:of|=|:|为|是)?\s*{_NUM}", re.IGNORECASE)),
 ]
 
+#: 「**数值在前**」的写法 —— 2026-10-29 由 51 份真实论文逼出来的补充。
+#:
+#: 上面那组模式只认「指标词 → 数字」的顺序（`accuracy of 76.5%`），而真实论文更常写
+#: 数字在前：DETR 摘要写 `42 AP`、CenterNet 写 `45.1% COCO AP`、Glow 写 `3.35 bits/dim`。
+#: 实测 51 份里 28 份因此一条结果都抽不到（不是论文没写，是写法没覆盖）。
+#:
+#: ⚠ 代价是**误抽风险变高**：`Fig. 1 AP` / `Table 2 AP` 这种图注编号也会命中。
+#: 所以每条都过 `_result_veto()`（图注编号、引用方括号、数值范围三道否决），
+#: 且**只在正文/章节位置成立时**登记。宁可少抽，也不能把图号当精度写进证据。
+_NUMFIRST: list[tuple[str, re.Pattern]] = [
+    ("accuracy", re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,2})?)\s*%\s*(?:top-?[15]\s+)?(?:accuracy|acc)\b", re.IGNORECASE)),
+    ("accuracy", re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,2})?)\s*(?:%|\s)\s*top-?[15]\s+(?:accuracy|acc)\b", re.IGNORECASE)),
+    ("ap", re.compile(r"(?<![\w.])(\d{1,2}(?:\.\d{1,2})?)\s*(?:%|\s)\s*(?:box\s+|mask\s+)?AP(?:50|75|s|m|l)?\b")),
+    ("f1", re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,2})?)\s*(?:%|\s)\s*F1\b", re.IGNORECASE)),
+    ("psnr", re.compile(r"(?<![\w.])(\d{1,2}\.\d{1,2})\s*dB\b", re.IGNORECASE)),
+    ("ssim", re.compile(r"(?i)\bSSIM\b\s*(?:of|=|:|is)?\s*(\d\.\d{2,4})")),
+    ("bleu", re.compile(r"(?<![\w.])(\d{1,2}\.\d{1,2})\s*BLEU\b", re.IGNORECASE)),
+    ("miou", re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,2})?)\s*(?:%|\s)\s*(?:mIoU|IoU)\b", re.IGNORECASE)),
+    ("bits/dim", re.compile(r"(?<![\w.])(\d{1,2}\.\d{2})\s*bits\s*/\s*dim", re.IGNORECASE)),
+]
+
+#: 每个指标的**合法数值区间**。超出一律不登记 —— 这是挡「把图号/年份当精度」的最后一道。
+#: `bits/dim` 是负对数似然，ImageNet 上约 1–4；`fid` 能到几百。
+_RESULT_RANGE: dict = {
+    "accuracy": (0.0, 100.0), "f1": (0.0, 100.0), "precision": (0.0, 100.0),
+    "recall": (0.0, 100.0), "ap": (0.0, 100.0), "miou": (0.0, 100.0),
+    "bleu": (0.0, 100.0), "psnr": (5.0, 60.0), "ssim": (0.0, 1.0),
+    "loss": (0.0, 100.0), "silhouette": (-1.0, 1.0), "bits/dim": (0.0, 20.0),
+    "fid": (0.0, 500.0), "inception": (0.0, 100.0),
+    # Inception Score 在 ImageNet 上几十到几百
+    "is": (0.0, 1000.0),
+    # 表格通道用到的：困惑度在语言模型上几十到几百，上限给到 10000 足够
+    "ppl": (0.0, 10000.0),
+}
+
+#: 数字前面出现这些, 说明它是**图注/表号/式号/章节号**, 不是实验结果。
+#: 窗口取 16 字符: 实测 `Table 2 shows ... 42 AP` 里 42 离 Table 太远, 不会被误判。
+_RESULT_REF_BEFORE = re.compile(
+    r"(?i)(?:fig(?:ure)?\.?|tab(?:le)?\.?|eq(?:uation)?\.?|sec(?:tion)?\.?|alg(?:orithm)?\.?|"
+    r"appendix|补充材料)\s*\.?\s*\d{0,2}\s*[.:]?\s*$")
+
+
+#: 强结果动词 —— 只有含这些词的句子才被当成「结果句」，句内才允许「数值在前」匹配。
+#:
+#: 为什么必须有这道: 不加时实测会把 DETR 的 `approximately 1 AP`（讲随机裁剪比例）、
+#: CenterNet 的 `0.5 IOU threshold`、SENet 表头 `AP@IoU=0.5` 全当成精度登记 ——
+#: 这些句子都在讲**参数/阈值**, 没有一个在报结果。加了动词闸门, 它们全部落选。
+_RESULT_VERB = re.compile(
+    r"(?i)\b(?:achiev\w*|obtain\w*|reach\w*|report\w*|outperform\w*|surpass\w*|exceed\w*|"
+    r"state-of-the-art|sota|yield\w*|deliver\w*|improv\w*|reduc\w*\s+(?:error|loss))\b|"
+    r"达到|取得|实现|优于|提升")
+
+#: 数字**前面**是这些 = 它是阈值/约数/超参, 不是结果。
+_NUM_PREFIX_BAD = re.compile(
+    r"(?i)(?:[=@~≈<>]\s*|approximately\s+|approx\.?\s*|about\s+|around\s+|roughly\s+|"
+    r"up to\s+|at most\s+|at least\s+|less than\s+|more than\s+|"
+    r"(?:threshold|ratio|probability|prob\.?|margin|alpha|beta|gamma|k|p)\s*[=:of]{0,2}\s*)\s*$")
+#: 数字**后面**是这些 = 它在解释阈值/比率, 不是结果。
+_NUM_SUFFIX_BAD = re.compile(r"(?i)^\s*(?:threshold|ratio|probability|of the|interval)")
+
+
+def _sentences_with_pos(text: str) -> list[tuple[int, str]]:
+    """按句切成 (起始偏移, 句子)。
+
+    ⚠ **不按换行切**。PDF 的换行是排版需要，不是句子边界 —— 实测 CenterNet 摘要：
+        `Center-\\nNet achieves the best speed-accuracy trade-off on the MS\\nCOCO dataset,
+         with 28.1% AP at 142 FPS, 37.4% AP at 52\\nFPS`
+    按换行切会把 `achieves` 和 `28.1% AP` 分进两段，于是「结果句」判据永远不成立。
+    只按 `[.;!?]` 后面跟空白切，跨行的一句话仍然是同一句。
+    小数点和图号不会被切断（`3.14` 后面没有空白）。
+    """
+    out, start = [], 0
+    for m in re.finditer(r"(?<=[.;!?])\s+", text or ""):
+        seg = text[start:m.start()]
+        if len(seg.strip()) >= 8:
+            out.append((start, seg))
+        start = m.end()
+    seg = (text or "")[start:]
+    if len(seg.strip()) >= 8:
+        out.append((start, seg))
+    return out
+
+
+#: 以百分数报结果的指标。这类指标**小于 10 且不带 `%`** 时几乎都不是结果
+#: （实测误抽：`AP 2.7`、`F1 01`、`accuracy 2`、`mIoU 5.4`、`precision 0.0`）。
+_PCT_METRICS = frozenset({"accuracy", "ap", "miou", "f1", "precision", "recall", "bleu"})
+
+
+def _result_veto(metric: str, text: str, start: int, end: int, raw: str) -> str:
+    """实验结果的三道否决。返回非空字符串 = 否决原因（用于排查, 不写进证据）。"""
+    # ① 数值区间
+    lo, hi = _RESULT_RANGE.get(metric, (0.0, 1e9))
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return "数值无法解析"
+    if not (lo <= val <= hi):
+        return f"{val} 不在 {metric} 的合法区间 [{lo}, {hi}]"
+    # ①b 百分数类指标：数值 < 10 又没带百分号 → 多半是阈值/编号/图号
+    if metric in _PCT_METRICS and val < 10.0 and "%" not in text[end:end + 3]:
+        return f"{metric}={val} 偏小且没带百分号, 疑似阈值/编号"
+    # ② 前面是图注/表号/式号
+    before = text[max(0, start - 16):start]
+    if _RESULT_REF_BEFORE.search(before):
+        return "紧跟图注/表号, 不是实验结果"
+    # ③ 前面是阈值/约数/超参（`=0.5`、`approximately 1`、`threshold 0.5`）
+    if _NUM_PREFIX_BAD.search(text[max(0, start - 24):start]):
+        return "数字前面是阈值/约数/超参"
+    # ④ 后面是阈值/比率说明
+    if _NUM_SUFFIX_BAD.match(text[end:end + 14]):
+        return "数字后面是阈值/比率说明"
+    # ⑤ 后面紧跟方括号引用号（`42 [58]` —— CenterNet 就是这么写的, 那是别人论文的数）
+    after = text[end:end + 4]
+    if re.match(r"\s*\[\d", after):
+        return "数字后跟引用号, 属于引用他人的结果"
+    # ⑥ 数字在括号/方括号里 —— `ResNet [30] (40.6% AP in 4.1 FPS)` 这种是**引述他人**的
+    #    结果, 括号本身就是"补充说明别人"的信号（CenterNet 实测因此抽错成 40.6）。
+    if text[max(0, start - 2):start].rstrip().endswith(("(", "[")):
+        return "数字在括号内, 属于引述他人的结果"
+    return ""
+
 # 数据集声明: "CIFAR-10 v2.1" / "on CIFAR-10" / "ImageNet dataset"
 # 同页同行必须出现数据集语境词, 否则视为参考文献里的顺带提及(防误抽)
 _DATASET_RE = re.compile(
@@ -275,7 +396,10 @@ _TEXT_VETO = {
     # 已知的两个真误抓("the sine-cosine version … positional embedding" /
     # "average cosine similarity between these tokens")由下面两条覆盖。
     "scheduler": re.compile(
-        r"similarity|sine-?cosine|cosine\s+(?:distance|similarity)",
+        # 2026-10-29 补 `sine ... cosine`: DETR 原文「2 sine and cosine / d channel
+        # positional encoding」(正弦位置编码)，原来只认连字符写法 sine-cosine，
+        # 于是把位置编码读成了 LR 调度器 —— 与代码里的 StepLR 撞成一条假冲突。
+        r"similarity|sine\s*(?:-|–|—|and|&)\s*cosine|cosine\s+(?:distance|similarity)",
         re.IGNORECASE),
     "optimizer": re.compile(
         r"minibatch\s+SGD|SGD:\s*\w|Proceedings|Conference|arXiv|doi:", re.IGNORECASE),
@@ -538,6 +662,256 @@ def _extract_tables(pdf_path: str) -> list[tuple[int, list[list[str]]]]:
     return out
 
 
+# ============================================================ 按坐标重组表格行（2026-10-30）
+# 为什么必须自己算坐标（这是「25 份论文抽不到结果指标」的真正病根）:
+#   ① arXiv 双栏 PDF 的文本层是**按列**输出的。DETR 第 13 页的 Table 3，
+#      get_text("text") 给出的是「spatial pos. enc. / output pos. enc. / encoder /
+#      decoder / decoder / AP / ∆ / AP50 / ∆ / none / none / learned at input /
+#      32.8 / -7.8 / 55.2 / -6.5 / ...」—— 每个单元格单独一行，指标名和它对应的
+#      数字隔了几十行，按句子切分永远对不上。
+#   ② pymupdf 的 find_tables 在**无边框三线表**上完全失效: 实测 DETR 只抓到 4 张
+#      「表」，全是插图/公式区的碎片，真正的 Table 3/4 一张没抓到。
+#   唯一可靠的定位信息是每个词的 (x, y): 同一行的词 y 相近，同列的词 x 相近。
+#   实测同一套坐标规则把上面那张表完整还原成
+#      「encoder || decoder || decoder || AP || ∆ || AP50 || ∆」
+#      「none || none || learned at input || 32.8 || -7.8 || 55.2 || -6.5」
+
+#: 同一行: 词与行基准 y 的差不超过这个值（约半个字高，正文约 10pt）
+_ROW_TOL = 3.5
+#: 同一行内: 相邻词的 x 间隙超过这个值就算换了一列（同列单词间距通常 < 3pt）
+_CELL_GAP = 6.0
+#: 一个纯数值单元格（允许负号、百分号；不含单位，单位会在同一单元格里跟着数字）
+_CELL_NUM = re.compile(r"^[-−–+]?\d{1,4}(?:\.\d{1,4})?%?$")
+
+
+def _has_gutter(words, width: float, height: float) -> bool:
+    """页面中间是否存在一条**贯穿版面的空白竖带**（双栏排版的 gutter）。
+
+    踩过的两个坑，决定了判据长这样:
+      ① 按「中间带里有几个词」判 —— 跨栏的宽表格（DETR 第 13 页的 Table 3 就横跨
+         整页）会把词摆在中线附近，于是被误判成双栏，表格被拦腰切成左右两半，
+         指标名和数字分到不同栏里，比不判栏还糟。
+      ② 只看某一处有没有空隙 —— 表格列与列之间的空隙也有 50pt，会被当成 gutter。
+    所以改成**纵向分段统计**: 把页面按高度切成 20 段，只有「有内容的分段足够多
+    （≥8）」且「其中 60% 以上中间带是空的」才算双栏。稀疏页（表格只占几行）
+    一律按单栏处理 —— 宁可少判一次栏，也不能把一张好表切坏。
+    """
+    lo, hi = width * 0.42, width * 0.58
+    seg_n = 20
+    filled = 0
+    empty = 0
+    for i in range(seg_n):
+        top, bottom = height * i / seg_n, height * (i + 1) / seg_n
+        seg = [w for w in words if w[1] < bottom and w[3] > top]
+        if not seg:
+            continue
+        filled += 1
+        if not any(w[2] > lo and w[0] < hi for w in seg):
+            empty += 1
+    return filled >= 8 and empty >= filled * 0.6
+
+
+def _page_rows(page) -> list[list[str]]:
+    """把一页的文字按坐标重组成「行 × 单元格」。
+
+    返回 [[cell, cell, ...], ...]，行自上而下，行内自左而右。
+    双栏页先按中间那条空白竖带判栏，再在每栏内部聚行 —— 不分栏的话，
+    左右两栏恰好同高的行会被拼成一行，一个指标名配上另一栏的数字。
+    """
+    words = page.get_text("words")          # (x0,y0,x1,y1,word,block,line,wno)
+    if not words:
+        return []
+    width = page.rect.width
+    mid = width / 2.0
+    two_col = _has_gutter(words, width, page.rect.height)
+    columns = [(0.0, mid), (mid, width)] if two_col else [(0.0, width)]
+
+    rows: list[list[str]] = []
+    for lo, hi in columns:
+        col_words = [w for w in words if lo <= (w[0] + w[2]) / 2 < hi]
+        if not col_words:
+            continue
+        col_words.sort(key=lambda w: (round(w[1], 1), w[0]))
+        lines: list[list] = []
+        cur: list = []
+        base = None
+        for w in col_words:
+            if base is None or abs(w[1] - base) <= _ROW_TOL:
+                cur.append(w)
+                if base is None:
+                    base = w[1]
+            else:
+                lines.append(cur)
+                cur, base = [w], w[1]
+        if cur:
+            lines.append(cur)
+        for ln in lines:
+            ln.sort(key=lambda w: w[0])
+            cells: list[str] = []
+            acc: list[str] = []
+            prev_x1 = None
+            for w in ln:
+                if prev_x1 is not None and w[0] - prev_x1 > _CELL_GAP:
+                    cells.append(" ".join(acc))
+                    acc = []
+                acc.append(w[4])
+                prev_x1 = w[2]
+            if acc:
+                cells.append(" ".join(acc))
+            if any(c.strip() for c in cells):
+                rows.append(cells)
+    return rows
+
+
+#: 表头单元格 -> 规范指标名。**只认主指标**，子指标各自归到主指标名下
+#: （Top-1/Top-5 都算 accuracy、FID/sFID 都算 fid）—— 否则「论文声明的结果」里
+#: 会冒出一堆近义词，判定层还要再写一遍同义映射。
+#: 差值列（∆ / Δ）不是结果本身，明确排除。
+#: ⚠ 词表放宽的代价由「表头至少两个指标列」那道闸兜底，别把数据集名加进来
+#:   （GPT-2 那张词相似度表的列名里就有 "AP" = AP news，加进来就误抽了）。
+_HEADER_METRIC: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^(?:mAP|AP|AP\d{2})$"), "ap"),
+    (re.compile(r"^(?:top-?\d{1,3}|top\d|acc(?:uracy)?)$", re.IGNORECASE), "accuracy"),
+    (re.compile(r"^precision$", re.IGNORECASE), "precision"),
+    (re.compile(r"^recall$", re.IGNORECASE), "recall"),
+    (re.compile(r"^F1(?:-?score)?$", re.IGNORECASE), "f1"),
+    (re.compile(r"^(?:bleu(?:\d+)?)$", re.IGNORECASE), "bleu"),
+    (re.compile(r"^(?:ppl|perplexity)$", re.IGNORECASE), "ppl"),
+    (re.compile(r"^(?:m?iou)$", re.IGNORECASE), "miou"),
+    (re.compile(r"^psnr$", re.IGNORECASE), "psnr"),
+    (re.compile(r"^ssim$", re.IGNORECASE), "ssim"),
+    (re.compile(r"^s?FID$", re.IGNORECASE), "fid"),
+    # 这里**不加 IGNORECASE**: 表头里的 "is" 是普通英文词，加了会把
+    # "this is a table" 这类碎片认成 Inception Score。
+    (re.compile(r"^(?:IS|Inception Score)$"), "is"),
+]
+
+#: 这些指标**越小越好** —— 取表内代表值时要取最小而不是最大。
+_LOWER_IS_BETTER = {"loss", "ppl", "fid", "bits/dim", "wer"}
+
+#: 表格里一个指标的「代表值」怎么取 —— 这一层只做登记，不改任何判定
+_TABLE_ROW_CAP = 16          # 一张表最多往下看这么多行
+
+
+def _header_metric(cell: str):
+    """表头单元格 -> 规范指标名（认不出返回 None）。"""
+    c = cell.strip().replace("−", "-")
+    if not c or len(c) > 12:
+        return None
+    for pat, name in _HEADER_METRIC:
+        if pat.match(c):
+            return name
+    return None
+
+
+def _rows_to_results(rows: list[list[str]]) -> list[tuple[str, str, str]]:
+    """从坐标行里认出「指标表」并取代表值。
+
+    返回 [(metric, raw_value, snippet), ...]。
+    防误报的四道闸（缺一不可）:
+      1. 表头行必须含**可识别的指标名**，且该行本身不是数值行；
+      2. 数据行与表头的**列数必须一致** —— 这是「按坐标对齐」的核心，
+         也是最强的一道: 正文段落切成同样列数的概率极低；
+      3. 值必须落在该指标的合法区间（`_RESULT_RANGE`）；
+      4. 至少要凑够 2 个有效数据行，单行不算表。
+    代表值取法: 越大越好的取表内最大值、越小越好的取最小值 —— 论文主张的
+    通常是最优配置，而不是表格第一行的 ablation 变体。snippet 里同时给出表头、
+    用到的行数与取值口径，人可以回原文核。
+    """
+    out: list[tuple[str, str, str]] = []
+    n = len(rows)
+    for i, cells in enumerate(rows):
+        if len(cells) < 3:
+            continue
+        nums_in_header = sum(1 for c in cells if _CELL_NUM.match(c.strip()))
+        if nums_in_header > len(cells) // 2:
+            continue                       # 这一行本身是数据行，不是表头
+        # 表头里至少要认出**两个**指标列，才认它是指标表。
+        # 只认出一个的时候，绝大多数是「列名恰好撞上指标缩写」：
+        # 实测 GPT-2 第 8 页那张词相似度表，最后一列的列名就是数据集名 "AP"
+        # （AP news），于是被当成平均精度，抽出了 ap=0.321。
+        # 正常的指标表都有并列列（AP/AP50、Top-1/Top-5、PPL/BLEU），代价很小。
+        # ⚠ 必须**先数命中个数、再去重**：DETR 的表头是 AP/∆/AP50/∆，
+        # 两个指标都归一到 ap，先去重就只剩一列，会被这条闸误杀。
+        raw_hits = []
+        for ci, c in enumerate(cells):
+            name = _header_metric(c)
+            if not name:
+                continue
+            if re.search(r"\s\d", c):
+                # 列名里夹着空格+数字（"Accuracy 60"）—— 真表头不长这样，
+                # 这是正文句子被坐标切成几段后的碎片。实测 DINOv2 第 3 页
+                # 的「Accuracy | Accuracy 60 | Accuracy」就是这么被误认成表头的。
+                continue
+            raw_hits.append((ci, name, c.strip()))
+        # 真表的并列列写的是**不同**名字（AP/AP50、Top-1/Top-5）。
+        # 认出来的指标全是同一个词，说明这张"表"其实是正文句子被切成的几段
+        # —— DINOv2 p3 只剩两个 "Accuracy"，就是这种情况。
+        if len({t for _ci, _n, t in raw_hits}) < 2:
+            continue
+        if len(raw_hits) < 2:
+            continue
+        col_map: dict[int, str] = {}
+        for ci, name, _t in raw_hits:
+            if name not in col_map.values():
+                col_map[ci] = name         # 同一指标只认第一列（AP 在前、AP50 在后）
+        width = len(cells)
+        # 收集时就带上**这一行的原文** —— 最后取的是最大值/最小值，可能出自第 3 行
+        # 而不是首行；只给首行的话，人回原文核对时会对不上，等于证据不可核。
+        vals: dict[str, list[tuple[float, str]]] = {m: [] for m in col_map.values()}
+        used: list[str] = []
+        for j in range(i + 1, min(i + 1 + _TABLE_ROW_CAP, n)):
+            nxt = rows[j]
+            if len(nxt) != width:
+                break                      # 列数一变，这张表就结束了
+            row_txt = " | ".join(nxt)
+            got = False
+            for ci, name in col_map.items():
+                raw = nxt[ci].strip() if ci < len(nxt) else ""
+                if not _CELL_NUM.match(raw):
+                    continue
+                num = normalize_number(raw)
+                if num is None:
+                    continue
+                lo, hi = _RESULT_RANGE.get(name, (0.0, 100.0))
+                if not (lo <= num <= hi):
+                    continue
+                vals[name].append((num, row_txt))
+                got = True
+            if got:
+                used.append(row_txt)
+            elif used:
+                break                      # 连续两行都取不到值 -> 表结束
+        if len(used) < 2:
+            continue
+        header_txt = " | ".join(cells)
+        for name, vs in vals.items():
+            if not vs:
+                continue
+            how = "最小" if name in _LOWER_IS_BETTER else "最大"
+            pick, src_row = (min(vs) if name in _LOWER_IS_BETTER else max(vs))
+            snip = (f"表头: {header_txt} ｜ 表内 {len(vs)} 个有效行，"
+                    f"取{how}值 {pick:g} ｜ 取值行: {src_row}")
+            out.append((name, f"{pick:g}", snip[:240]))
+        if out:
+            break                          # 一张表只认第一个表头
+    return out
+
+
+def _extract_rows(pdf_path: str) -> dict[int, list[list[str]]]:
+    """整份 PDF 的「坐标行」表：{页码: [[cell, ...], ...]}。"""
+    out: dict[int, list[list[str]]] = {}
+    with fitz.open(pdf_path) as doc:
+        for i, page in enumerate(doc):
+            try:
+                rows = _page_rows(page)
+            except Exception:      # noqa: BLE001
+                continue
+            if rows:
+                out[i + 1] = rows
+    return out
+
+
 # 表头里出现这些词才认为该表与超参数有关(否则多为插图区被误检为表格)
 _TABLE_HEADER_HINT = re.compile(
     r"(learning rate|batch|epoch|optimizer|dropout|weight decay|momentum|"
@@ -658,17 +1032,60 @@ def _in_bibliography(text: str, start: int, end: int, lines_around: int = 2) -> 
     return bool(_BIB_ENTRY_LINE.match(line))
 
 
+#: 首页页眉 / 版权行：排在正文最上面，但**不是标题**。
+# 实证 2026-10-29：ICLR 投稿模板的首页第一行是「Published as a conference paper at ICLR 2018」，
+# 被当成标题写进记忆库 → 好几篇不同论文的"标题"完全一样，记忆索引像"同一篇存了多条"。
+_BANNER_LINE = re.compile(
+    r"^(published\s+as\s+a\s+conference\s+paper"
+    r"|under\s+review\s+as\s+a\s+conference\s+paper"
+    r"|proceedings\s+of|to\s+appear\s+in|accepted\s+(at|by)|preprint\b"
+    r"|arxiv:|copyright\b|©|all\s+rights\s+reserved|doi:|https?://)",
+    re.IGNORECASE)
+
+
 def parse_paper(pdf_path: str) -> PaperInfo:
     """解析论文 PDF, 输出 PaperInfo(参数与结果均带页码证据)。"""
     info = PaperInfo()
-    pages, info.page_coverage = _extract_pages(pdf_path)
+    try:
+        pages, info.page_coverage = _extract_pages(pdf_path)
+    except FileNotFoundError:
+        # 路径本身不存在 —— 这是**用户填错了**，必须明确报错。
+        # 静默出一份空报告比报错更糟: 用户会以为"审计做完了, 论文确实没参数"。
+        raise
+    except Exception as e:  # noqa: BLE001
+        # ⚠ pymupdf 抛的是它自己的 FileNotFoundError（继承 RuntimeError），
+        # 不是内置的 FileNotFoundError —— 上面那个 except 拦不住，这里再按类型名认一次。
+        if type(e).__name__ == "FileNotFoundError":
+            raise
+        # 打不开的 PDF(伪装成 .pdf 的文本、损坏文件、加密文件)不该让整次审计炸掉:
+        # 返回空页集, 让下游按"没读到论文"处理(可信度低、结论标注材料不足),
+        # 并把原因如实写进页覆盖表 —— 用户能看见"为什么什么都没读出来"。
+        pages = []
+        info.page_coverage = [{"page": 0, "chars": 0, "images": 0,
+                               "status": "unreadable",
+                               "note": f"论文读不出来（{type(e).__name__}）: {e}"}]
     info.page_count = len(pages)
     info.page_texts = pages          # 供抽取 Agent 回原文核对
 
     # ---- 表格通道: 三线表里的超参数(纯文字层, 无需 OCR)
     tables_by_page: dict[int, list[list[list[str]]]] = {}
-    for page_no, rows in _extract_tables(pdf_path):
-        tables_by_page.setdefault(page_no, []).append(rows)
+    try:
+        for page_no, rows in _extract_tables(pdf_path):
+            tables_by_page.setdefault(page_no, []).append(rows)
+    except Exception:  # noqa: BLE001
+        # 与上面的页解析同款: 文件打不开时表格通道也读不了, 跳过即可,
+        # 不能因为「同一份坏文件被第二次打开」再抛一次。
+        tables_by_page = {}
+
+    # ---- 坐标行通道: 结果指标表（无边框三线表，find_tables 抓不到的那种）
+    # 与上面的表格参数通道分开取: 那个走 pymupdf 的自动识别（适合有框线的参数表），
+    # 这个走自己的坐标重建（适合无框线的指标表）。两者互补，不互相替代。
+    rows_by_page: dict[int, list[list[str]]] = {}
+    try:
+        rows_by_page = _extract_rows(pdf_path)
+    except Exception:  # noqa: BLE001
+        # 同上: 坏文件已经在上面的页解析里报过一次，这里不再抛
+        rows_by_page = {}
 
     numeric_pats: list[tuple[str, re.Pattern]] = []
     for key, (_disp, aliases) in PARAM_SYNONYMS.items():
@@ -767,8 +1184,12 @@ def parse_paper(pdf_path: str) -> PaperInfo:
         if page_no == 1:
             non_empty = [l.strip() for l in lines
                          if l.strip() and not l.strip().isdigit() and len(l.strip()) > 4]
-            if non_empty:
-                info.title = non_empty[0]
+            # 页眉/版权行不是标题。实证 2026-10-29：ICLR 投稿模板首页第一行是
+            # 「Published as a conference paper at ICLR 2018」，被当成标题写进记忆库，
+            # 于是**好几篇不同论文的"标题"一模一样**，记忆索引看着像"同一篇存了多条"。
+            _t = [l for l in non_empty if not _BANNER_LINE.search(l)]
+            if _t:
+                info.title = _t[0]
             abs_m = re.search(r"\babstract\b[\s\-—:]*(.{50,1200}?)(?:\n\s*\n|\b1\.?\s*Introduction\b|\bI\.\s*INTRODUCTION\b)",
                               text, re.IGNORECASE | re.DOTALL)
             if abs_m:
@@ -874,14 +1295,19 @@ def parse_paper(pdf_path: str) -> PaperInfo:
             ))
 
         # ---- 实验结果
+        # 两组模式, 走两条不同的路（2026-10-29 由 28 份抽不到结果的论文逼出来的）:
+        #   ① 指标词在前（`accuracy of 76.5%`）—— 模式本身够严, 全页扫;
+        #   ② 数值在前（`42 AP` / `45.1% COCO AP`）—— **只在含结果动词的句子内扫**,
+        #      否则会把 `Fig. 1 AP`、`AP@IoU=0.5`、`approximately 1 AP` 全当精度。
         for metric, pat in _RESULT_PATTERNS:
             if metric in info.results:
                 continue
-            m = pat.search(text)
-            if m:
+            for m in pat.finditer(text):
                 if _in_bibliography(text, m.start(), m.end()):
                     continue
                 raw = m.group(1)
+                if _result_veto(metric, text, m.start(1), m.end(1), raw):
+                    continue
                 section = _find_section(lines[: text[: m.start()].count("\n") + 1])
                 info.results[metric] = Evidence(
                     source="paper",
@@ -890,6 +1316,54 @@ def parse_paper(pdf_path: str) -> PaperInfo:
                     raw_value=raw,
                     normalized=normalize_number(raw),
                     parser="text",
+                )
+                break
+
+        for s_off, sent in _sentences_with_pos(text):
+            if len(info.results) >= 4:
+                break
+            if not _RESULT_VERB.search(sent):
+                continue
+            for metric, pat in _NUMFIRST:
+                if metric in info.results:
+                    continue
+                for m in pat.finditer(sent):
+                    a, b = s_off + m.start(), s_off + m.end()
+                    if _in_bibliography(text, a, b):
+                        continue
+                    raw = m.group(1)
+                    if _result_veto(metric, text, s_off + m.start(1), s_off + m.end(1), raw):
+                        continue
+                    section = _find_section(lines[: text[:a].count("\n") + 1])
+                    info.results[metric] = Evidence(
+                        source="paper",
+                        location=f"Page {page_no}" + (f" · {section}" if section else ""),
+                        snippet=_snippet_around(text, a, b),
+                        raw_value=raw,
+                        normalized=normalize_number(raw),
+                        parser="text",
+                    )
+                    break
+
+        # ---- 表格里的结果指标(第三条通道, 2026-10-30)
+        # 为什么必须单开一条: 上面两条都要求「指标词与数字在同一句里」，
+        # 而表格的文本层是按列输出的 —— 两者相隔几十行，永远凑不到一个句子里。
+        # 实测 26 份论文一条结果都抽不到，根因就在这里（不是论文没写）。
+        # 放在两条文本通道**之后**: 文本有句子可读，证据强度高于表格单元格。
+        if len(info.results) < 4:
+            for metric, raw_v, snip in _rows_to_results(rows_by_page.get(page_no, [])):
+                if metric in info.results:
+                    continue
+                norm = normalize_number(raw_v)
+                if norm is None:
+                    continue
+                info.results[metric] = Evidence(
+                    source="paper",
+                    location=f"Page {page_no} · 表格",
+                    snippet=snip,
+                    raw_value=raw_v,
+                    normalized=norm,
+                    parser="table",
                 )
 
         # ---- 表格参数(三线表/参数表): 论文超参数常整表给出, 正文正则抓不到

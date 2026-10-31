@@ -210,7 +210,10 @@ out_dir = Path(tempfile.mkdtemp(prefix="p2l_skill_dist_"))
 try:
     zip_path = P.pack(SKILL_DIR, out_dir)
     check(zip_path.is_file() and zip_path.suffix == ".zip", "zip 已产出")
-    check("1.0.0" in zip_path.name, "文件名带版本号（来自 metadata.version）")
+    # 版本号从 frontmatter 派生 —— 写死 "1.0.0" 会在下次升版时变成假红
+    _ver = str((fm.get("metadata") or {}).get("version", ""))
+    check(bool(_ver) and _ver in zip_path.name,
+          f"文件名带版本号（metadata.version={_ver}）")
 
     with zipfile.ZipFile(zip_path) as zf:
         names = zf.namelist()
@@ -257,6 +260,32 @@ setup = (SKILL_DIR / "references" / "client-setup.md").read_text("utf-8")
 check("mcp>=1.0,<2" in setup, "client-setup.md 写明版本约束（与代码一致）")
 check("streamablehttp_client" in setup, "client-setup.md 给了 HTTP 接法")
 check("不发布" not in setup and "端砚" not in setup, "客户端文档不掺杂平台运营口径")
+
+sec("7b. 四站口径 —— 包里的说法与对外接口是同一套")
+
+# 3B: 技能包不能还讲老口径（功能平铺），必须与 mcp_server 的四站叙事一致。
+from paper2lab.toolbox import STATIONS  # noqa: E402
+
+bound = (SKILL_DIR / "references" / "boundaries.md").read_text("utf-8")
+check(len(STATIONS) == 4, "四站就是四站")
+for _st in STATIONS:
+    check(_st in body, f"SKILL.md 提到「{_st}」站")
+    check(_st in setup, f"client-setup.md 的工具表按「{_st}」分站")
+for _card in ("假设卡", "实验卡", "判定卡"):
+    check(_card in body, f"SKILL.md 用「{_card}」讲交接物（不说含糊的「做完了」）")
+check("提 → 做 → 判 → 改" in body, "SKILL.md 一句话说清四站主干")
+check("只出数" in body and "不造数" in body,
+      "SKILL.md 写明 ② 只出数、③ 不造数（2C 的结构不许在文案里说反）")
+check("不造数" in bound, "boundaries.md 也写明 ③ 不造数")
+check("9 项而非 10 项" not in bound,
+      "boundaries.md 已清掉旧的进度条口径（旧版写「9 项而非 10 项」）")
+
+# 3D: 对外工具表必须**一个不漏** —— 加了工具忘了写文档，客户端就会对着
+# 说明书找不到那个工具（"文档/界面/测试三处同源"这条规矩的落地断言）。
+from paper2lab.mcp_server import TOOL_NAMES  # noqa: E402
+
+for _tool in TOOL_NAMES:
+    check(_tool in setup, f"client-setup.md 登记了对外工具 `{_tool}`")
 
 print("\n" + "═" * 62)
 if FAILURES:

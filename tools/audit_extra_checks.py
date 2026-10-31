@@ -19,7 +19,9 @@ HERE = Path(__file__).resolve().parent.parent
 PY = str(HERE / ".venv/Scripts/python.exe")
 
 NON_UI = [
-    ("计划 vs 经典 一致性",        ["verify_plan_mode.py"], 600),
+    # 2026-10-25 删除「计划 vs 经典 一致性」一项: 经典模式已按用户口径删掉，
+    # 对照的另一头不存在了；"跑两遍一致"的确定性由 run_all_checks 的
+    # 「计划确定性 跑两遍一致 8套」承担。
     ("抽取 Agent 消融(开/关)",     ["verify_agent.py"], 900),
     ("Agent 采纳/拒绝 回原文核对", ["verify_agent_evidence.py"], 900),
     ("记忆容量上限与压缩",         ["verify_memory_capacity.py"], 600),

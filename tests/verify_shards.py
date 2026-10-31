@@ -53,7 +53,7 @@ def diff_count(a, b):
 
 
 try:
-    a, _ = run_audit(PDF, ZIP, RES, vision_max_regions=2, plan_mode=True)
+    a, _ = run_audit(PDF, ZIP, RES, vision_max_regions=2)
     findings = [f for f in a.findings if f.status.value != "consistent"]
     out.append(f"待归因结论：{len(findings)} 条 ｜ 并发上限 {llm.DEFAULT_MAX_WORKERS} 路")
     out.append(f"全流程分片记录：{(a.readiness or {}).get('llm_shards')}")
@@ -131,5 +131,8 @@ finally:
         out.append("")
         out.append("已还原 LLM 缓存")
 
-Path("_shard.txt").write_text("\n".join(out), encoding="utf-8")
+# 产物写到 .trash_tmp/，不在工程根目录留草稿（工作区卫生）
+_OUT = _pl.Path(__file__).resolve().parent.parent / ".trash_tmp"
+_OUT.mkdir(exist_ok=True)
+(_OUT / "_shard.txt").write_text("\n".join(out), encoding="utf-8")
 print("done")

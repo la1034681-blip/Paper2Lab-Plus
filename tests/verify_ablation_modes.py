@@ -1,12 +1,16 @@
-"""消融对照：**经典模式 vs 计划模式**，八套样本逐项比对。
+"""计划确定性：**同一份材料跑两次，计划与结论必须一模一样**（八套样本逐项比对）。
 
-这是"经典模式留着有什么用"的直接答案 —— 要证明「调度员没有改变任何结论」，
-必须有一个固定全跑的对照组。本脚本就是那个对照。
+2026-10-25 用户口径：删除「经典模式」（不看材料、固定全序全跑），只留"先排计划再执行"。
+原先这一项是"经典 vs 计划"的对照，对照组没了，于是**改成守更要紧的一条**：
 
-比对三项（任一不一致即判失败）:
-  ① 结论签名（参数 / 状态 / 风险 / 论文取值 / 代码取值，逐条）
-  ② 就绪度核心字段（排除 llm_* 这类与调度无关的运行态字段）
-  ③ 审计可信度分数
+  审计平台最怕的不是"跳过了某个工具"，而是**同一份材料每次跑出来的结论不一样**。
+  所以这里守两件事：
+    ① **计划可复现** —— 两次跑的执行集合、顺序、跳过理由逐字一致；
+    ② **结论可复现** —— 结论签名 / 就绪度核心字段 / 审计可信度一致。
+
+  再加一条"跳过必须有话说"：每个被跳过的工具都得给出理由（不能空着跳过）。
+  「调度不改变结论」的另一个证据在 verify_llm_planner.py：模型把 13 件工具全跳了，
+  结论照样产出 —— 那是"人（模型）乱来也不改结论"，这里是"机器自己跑要稳"。
 
 用法: .venv\\Scripts\\python.exe verify_ablation_modes.py
 """
@@ -62,64 +66,84 @@ def rd_core(a) -> dict:
             if not k.startswith("llm_") and k != "execution_log"}
 
 
+def plan_of(a) -> list:
+    """执行计划序列：刻意**不排序** —— 顺序本身也是计划的一部分。
+
+    每项 = (工具键, 状态, 理由)。两次跑必须逐项一致，否则就是"计划不可复现"。
+    """
+    steps = ((a.execution_log or {}).get("steps") or [])
+    return [(s.get("key"), s.get("status"), s.get("reason") or "") for s in steps]
+
+
 out: list[str] = []
-out.append("# 消融对照报告：经典模式（固定全跑） vs 计划模式（调度员排计划）")
+out.append("# 计划确定性报告：同一材料跑两次，计划与结论必须一致")
 out.append("")
-out.append("用途：证明**调度员没有改变任何结论**——这正是经典模式不能被删掉的首要理由。")
+out.append("用途：审计平台的第一条底线 —— **同一份材料，每次跑出来的东西要一样**。")
 out.append("")
-out.append("| 样本 | 结论数(经典/计划) | 结论签名 | 就绪度(经典/计划) | 就绪度字段 | "
-           "可信度(经典/计划) | 执行/跳过(计划) | 判定 |")
+out.append("| 样本 | 结论数 | 结论签名 | 计划序列 | 跳过理由齐全 | 就绪度 | 可信度 | 判定 |")
 out.append("|---|---|---|---|---|---|---|---|")
 
 bad = 0
 for name, pdf, code, res, real in CASES:
     ur = json.loads(Path(res).read_text(encoding="utf-8")) if res else None
-    a_c, _ = run_audit(str(pdf), str(code), ur, force_mock=not real, plan_mode=False)
-    a_p, _ = run_audit(str(pdf), str(code), ur, force_mock=not real, plan_mode=True)
+    a_1, _ = run_audit(str(pdf), str(code), ur, force_mock=not real)
+    a_2, _ = run_audit(str(pdf), str(code), ur, force_mock=not real)
 
-    ok_sig = sig(a_c) == sig(a_p)
-    ok_rd = rd_core(a_c) == rd_core(a_p)
-    ok_conf = ((a_c.coverage or {}).get("confidence_score")
-               == (a_p.coverage or {}).get("confidence_score"))
-    ok = ok_sig and ok_rd and ok_conf
+    ok_sig = sig(a_1) == sig(a_2)
+    ok_plan = plan_of(a_1) == plan_of(a_2)
+    skipped = [s for s in plan_of(a_1) if s[1] == "skipped"]
+    ok_reason = all(bool((s[2] or "").strip()) for s in skipped)
+    ok_rd = rd_core(a_1) == rd_core(a_2)
+    ok_conf = ((a_1.coverage or {}).get("confidence_score")
+               == (a_2.coverage or {}).get("confidence_score"))
+    ok = ok_sig and ok_plan and ok_reason and ok_rd and ok_conf
     if not ok:
         bad += 1
 
-    ex = a_p.execution_log or {}
     out.append(
-        f"| {name} | {len(a_c.findings)}/{len(a_p.findings)} | "
+        f"| {name} | {len(a_1.findings)} | "
         f"{'一致 ✅' if ok_sig else '**不同 ⚠**'} | "
-        f"{a_c.readiness.get('total')}/{a_p.readiness.get('total')} | "
-        f"{'一致 ✅' if ok_rd else '**不同 ⚠**'} | "
-        f"{(a_c.coverage or {}).get('confidence_score')}/"
-        f"{(a_p.coverage or {}).get('confidence_score')} | "
-        f"{ex.get('ran')}/{ex.get('skipped')} | "
-        f"{'一致 ✅' if ok else '**不一致 ⚠**'} |")
+        f"{'一致 ✅' if ok_plan else '**不同 ⚠**'} | "
+        f"{'齐全 ✅' if ok_reason else '**空理由 ⚠**'} | "
+        f"{a_1.readiness.get('total')} | "
+        f"{(a_1.coverage or {}).get('confidence_score')} | "
+        f"{'通过' if ok else '**不通过 ⚠**'} |")
 
 out.append("")
-out.append(f"**结论：{len(CASES) - bad}/{len(CASES)} 套样本两种模式完全一致**"
-           + ("（调度员未改变任何结论）" if bad == 0 else "——有样本不一致，需排查！"))
+out.append(f"**结论：{len(CASES) - bad}/{len(CASES)} 套样本两次跑完全一致**"
+           + ("（计划与结论都可复现）" if bad == 0 else "——有样本不一致，需排查！"))
 out.append("")
 if bad:
     out.append("## 不一致明细")
     out.append("")
     for name, pdf, code, res, real in CASES:
         ur = json.loads(Path(res).read_text(encoding="utf-8")) if res else None
-        a_c, _ = run_audit(str(pdf), str(code), ur, force_mock=not real, plan_mode=False)
-        a_p, _ = run_audit(str(pdf), str(code), ur, force_mock=not real, plan_mode=True)
-        only_c = [x for x in sig(a_c) if x not in sig(a_p)]
-        only_p = [x for x in sig(a_p) if x not in sig(a_c)]
-        if only_c or only_p or rd_core(a_c) != rd_core(a_p):
-            out.append(f"### {name}")
+        a_1, _ = run_audit(str(pdf), str(code), ur, force_mock=not real)
+        a_2, _ = run_audit(str(pdf), str(code), ur, force_mock=not real)
+        p1, p2 = plan_of(a_1), plan_of(a_2)
+        if p1 != p2:
+            out.append(f"### {name} · 计划序列不同")
             out.append("")
-            if only_c or only_p:
-                out.append(f"- 仅经典模式有：{only_c}")
-                out.append(f"- 仅计划模式有：{only_p}")
-            # 就绪度**字段级** diff —— 只报"85 vs 87"没法定位，得指到具体字段上
-            rc2, rp2 = rd_core(a_c), rd_core(a_p)
-            for k in sorted(set(rc2) | set(rp2)):
-                if rc2.get(k) != rp2.get(k):
-                    out.append(f"- 就绪度字段 `{k}`：经典={rc2.get(k)} vs 计划={rp2.get(k)}")
+            for x, y in zip(p1, p2):
+                if x != y:
+                    out.append(f"- 第一次 `{x}` vs 第二次 `{y}`")
+            out.append("")
+        only_1 = [x for x in sig(a_1) if x not in sig(a_2)]
+        only_2 = [x for x in sig(a_2) if x not in sig(a_1)]
+        if only_1 or only_2:
+            out.append(f"### {name} · 结论签名不同")
+            out.append("")
+            out.append(f"- 仅第一次有：{only_1}")
+            out.append(f"- 仅第二次有：{only_2}")
+            out.append("")
+        # 就绪度**字段级** diff —— 只报"85 vs 87"没法定位，得指到具体字段上
+        r1, r2 = rd_core(a_1), rd_core(a_2)
+        if r1 != r2:
+            out.append(f"### {name} · 就绪度字段不同")
+            out.append("")
+            for k in sorted(set(r1) | set(r2)):
+                if r1.get(k) != r2.get(k):
+                    out.append(f"- `{k}`：第一次={r1.get(k)} vs 第二次={r2.get(k)}")
             out.append("")
 
 OUT = ROOT / "ablation_modes_report.md"

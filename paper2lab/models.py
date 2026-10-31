@@ -96,6 +96,13 @@ class Finding:
     risk_reason: str = ""          # 风险分级理由(为什么是这一级, 由 risk.py 给出)
     verified: bool = True          # 证据自证是否通过(审计的审计)
     verify_note: str = ""          # 自证细节(未通过原因)
+    # ---- 2026-10-25: 模型先判、程序后验（`judge_llm` 模块回填）
+    # **只加新键, 不动上面任何一个既有字段的语义**（报告 / 界面 / 断言都按老键读）。
+    # 口径: `status` 永远由规则写（可重算）; 模型的话只存这三格, 不一致时并列, 不覆盖。
+    # llm_agree:  True=两边一致 / False=两边不一致 / None=没比成（模型没判, 或规则那边没结论）
+    llm_status: Optional[Status] = None
+    llm_why: str = ""
+    llm_agree: Optional[bool] = None
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -103,6 +110,8 @@ class Finding:
         d["status"] = self.status.value
         d["confidence"] = self.confidence.value
         d["risk"] = self.risk.value
+        # 枚举不能直接进 asdict 后序列化 —— 与上面四个字段同款处理
+        d["llm_status"] = self.llm_status.value if self.llm_status else ""
         return d
 
     @staticmethod
@@ -123,6 +132,9 @@ class Finding:
             note=d.get("note", ""),
             verified=d.get("verified", True),
             verify_note=d.get("verify_note", ""),
+            llm_status=Status(d["llm_status"]) if d.get("llm_status") else None,
+            llm_why=d.get("llm_why", ""),
+            llm_agree=d.get("llm_agree"),
         )
 
 
@@ -207,6 +219,33 @@ class AuditResult:
     # 报告与界面只拿得到 audit, 否则这两件事永远是"报告之外的独立脚本动作"。
     rootcause: list = field(default_factory=list)   # List[TraceResult]
     patches: list = field(default_factory=list)     # List[PatchProposal]
+    # 阶段二 2A: 假设卡(① 假设站的产物, 四站叙事里"提"的落点)。
+    # **只加新字段**, 不动任何既有字段语义 —— 与 rootcause / patches 同一套路。
+    hypotheses: list = field(default_factory=list)   # [hypothesis.Hypothesis] 已按可验证性排序
+    hypothesis_total: int = 0                        # 共提出多少条（界面展示前 N 条, 总数如实报）
+    # 阶段二 2B: 推演的统计（待验 / 已排除 / 已定位各几条 ＋ 用的引擎名）。
+    # 空 dict = 本次**没做**推演 —— 与"推演了但全是待验"是两回事, 界面必须能分开说,
+    # 所以不用 0 兜底、也不给默认值（默认值会把"没推演"伪装成"推演了没结论"）。
+    hypothesis_stats: dict = field(default_factory=dict)
+    # 阶段二 2D: 实验卡（② 实验站的产物 —— 设计 ＋ 真跑记录 ＋ 实际值）。
+    # 同样只加新字段; 空 dict / 空 list 的含义与上面一致（空 = 本次没做, 不是"做了没结果"）。
+    experiments: list = field(default_factory=list)  # [experiment.ExperimentCard] 已排序
+    experiment_total: int = 0                        # 共设计了多少张（界面展示前 N 条, 总数如实报）
+    experiment_stats: dict = field(default_factory=dict)
+    # 阶段二 2E: 图表线索（① 假设站「读」这一步的多模态产物 —— 图注原文 ＋ 图上可见信息）。
+    # 空 list = 本次没做（或论文里没找到图注/图）; 与 experiments 同一套"只加新字段"的做法。
+    figure_clues: list = field(default_factory=list)   # [multimodal.FigureClue] 已排序
+    figure_total: int = 0                              # 共读到多少条（界面展示前 N 条）
+    figure_stats: dict = field(default_factory=dict)
+    # 阶段二 2E-化学: 化学身份记录（同属「读」这一步, 但产物与图表线索分开挂）——
+    # 分子式 / CAS / SMILES / 分子量声明, 每条都带"算出来的数"与"对不上的理由"。
+    # 空 list = 本次没抽到（或不是化学领域论文）, **不等于"查了没问题"**。
+    chem_items: list = field(default_factory=list)     # [chem.ChemItem] 已排序
+    chem_total: int = 0
+    chem_stats: dict = field(default_factory=dict)
+    # 这批化学结果是不是「模型跳过了该步、程序兜底补算」出来的。
+    # True 时报告与界面必须写明 —— 跳过可以，静默不行。
+    chem_fallback: bool = False
     # 阶段五（M2 闭环扩展）: 「搜 / 算 / 做」+ 迭代回边的产物。
     # 同样是"报告与界面只拿得到 audit"这个理由 —— 挂在 AuditResult 上才看得见。
     compute: dict = field(default_factory=dict)     # 「算」小规模复算与静态推演

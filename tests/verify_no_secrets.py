@@ -25,8 +25,8 @@ BRANCH = "main"
 MIN_SECRET_LEN = 12                      # 短于此值的"密钥"不值得反查（噪音太大）
 
 # 值长这样的是**公开地址**，不是凭据 —— 命中不算泄露。
-# 实例：.env 里的 VISION_BASE_URL 就是 vision.py:124 内置的那个公开端点
-#       `https://api.xiaomimimo.com/v1`，反查必然命中，但它本来就不是秘密。
+# 实例：.env 里的 VISION_BASE_URL 就是一个公开端点（如 `https://api.deepseek.com/v1`），
+#       反查必然命中，但它本来就不是秘密。
 PUBLIC_VALUE = re.compile(r"^https?://[^@\s]+$")
 _TOKENISH_IN_URL = ("token=", "key=", "secret=", "apikey=", "api_key=", "sig=")
 

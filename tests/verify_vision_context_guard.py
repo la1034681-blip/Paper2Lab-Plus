@@ -18,7 +18,10 @@ from paper2lab.pipeline import run_audit
 
 load_env()
 ROOT = Path(r"C:\Users\lijiahui\Desktop\Paper2Lab测试集")
-HERE = Path(r"C:\Users\lijiahui\Desktop\比赛")
+# ⚠ 2026-10-29 修: 同 verify_dist_guard —— 旧路径 `Desktop\比赛` 已不是被测项目。
+HERE = Path(__file__).resolve().parent.parent
+_OUT = HERE / ".trash_tmp"
+_OUT.mkdir(exist_ok=True)
 
 # 名称 -> (pdf, code, results, 真实API, 基准(结论数, 就绪度))
 BASE = {
@@ -46,7 +49,7 @@ out.append("|---|---|---|---|---|---|---|")
 bad = 0
 for name, pdf, code, res, real in CASES:
     ur = json.loads(Path(res).read_text(encoding="utf-8")) if res else None
-    a, _ = run_audit(str(pdf), str(code), ur, force_mock=not real, plan_mode=True)
+    a, _ = run_audit(str(pdf), str(code), ur, force_mock=not real)
     cov = a.coverage or {}
     im = cov.get("image") or {}
     n_before, r_before = BASE[name]
@@ -64,5 +67,5 @@ for name, pdf, code, res, real in CASES:
 
 out.append("")
 out.append(f"结论与就绪度**完全一致**的样本: {len(CASES) - bad}/{len(CASES)}")
-(HERE / "_vision_guard_check.txt").write_text("\n".join(out), encoding="utf-8")
+(_OUT / "_vision_guard_check.txt").write_text("\n".join(out), encoding="utf-8")
 print("done")

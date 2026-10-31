@@ -22,8 +22,8 @@ from paper2lab.pipeline import run_audit         # noqa: E402
 
 pdf, code = ROOT / "03_NeRF/paper.pdf", ROOT / "03_NeRF/code.zip"
 print("跑两遍：经典模式 与 计划模式（都走真实 LLM 归因，与对照脚本同口径）…")
-a_c, _ = run_audit(str(pdf), str(code), None, plan_mode=False)
-a_p, _ = run_audit(str(pdf), str(code), None, plan_mode=True)
+a_c, _ = run_audit(str(pdf), str(code), None)
+a_p, _ = run_audit(str(pdf), str(code), None)
 
 sc = [(f.param_key, f.status.value, f.risk.value) for f in a_c.findings]
 sp = [(f.param_key, f.status.value, f.risk.value) for f in a_p.findings]

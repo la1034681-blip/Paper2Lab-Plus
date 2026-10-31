@@ -109,53 +109,202 @@ def _distinct_values(evs: list[Evidence]) -> list[tuple[Any, Evidence]]:
     return out
 
 
+#: 证据位置里的页码: "Page 5 · Training" -> "5"
+_LOC_PAGE = re.compile(r"Page\s*(\d+)", re.IGNORECASE)
+#: 位置里页码与章节的分隔符(paper_parser 统一用 " · " 拼接)
+_LOC_SEP = "·"
+#: 片段里的数字(含科学计数法)
+_SNIPPET_NUM = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)")
+#: 与实验设置无关的编号: 引用号 [12] / 图表公式号 Table 3、Eq. (2)
+_NUM_NOISE = re.compile(
+    r"\[\d+(?:\s*[,;–-]\s*\d+)*\]"
+    r"|(?:Table|Tab\.|Figure|Fig\.|Section|Sec\.|Eq\.?|Equation|Algorithm|Appendix)"
+    r"\s*\(?\d+",
+    re.IGNORECASE,
+)
+
+
+def _loc_scope(loc: str) -> tuple[str, str]:
+    """证据位置 -> (页码, 章节)。"Page 5 · Training" -> ("5", "Training")。"""
+    loc = loc or ""
+    m = _LOC_PAGE.search(loc)
+    page = m.group(1) if m else ""
+    section = loc.split(_LOC_SEP, 1)[1].strip() if _LOC_SEP in loc else ""
+    return page, section
+
+
+def _setting_numbers(ev: Evidence) -> set[str]:
+    """片段里"描述这套实验设置"的数字集合(剔除本参数自己的取值与图表/引用编号)。"""
+    text = _NUM_NOISE.sub(" ", ev.snippet or "")
+    own = ev.normalized if isinstance(ev.normalized, (int, float)) else None
+    out: set[str] = set()
+    for tok in _SNIPPET_NUM.findall(text):
+        try:
+            if own is not None and abs(float(tok) - float(own)) <= 1e-12 * max(1.0, abs(float(own))):
+                continue      # 这一处就是本参数自己的取值, 不算"别的设置细节"
+        except ValueError:
+            pass
+        out.add(tok)
+    return out
+
+
+def _same_setting(a: Evidence, b: Evidence) -> bool:
+    """两处取值是不是"同一套实验设置"的两次声明(而不是两套不同实验)。
+
+    三条同时满足才算: 同页、同章节、且片段里除该取值外的数字完全一致。
+    (两处都在说 8 张卡、140 轮, 值却一个 5e-4 一个 2.5e-4 -> 才叫自相矛盾)
+
+    宁可漏判也不错判: 误报"论文自相矛盾"比漏报代价大得多 —— 读者会去原文里找一个不存在的错误。
+    """
+    pa, sa = _loc_scope(a.location)
+    pb, sb = _loc_scope(b.location)
+    if pa and pb and pa != pb:
+        return False
+    if sa and sb and sa != sb:
+        return False
+    return _setting_numbers(a) == _setting_numbers(b)
+
+
+def _multi_value_note(disp: str, distinct: list[tuple[Any, Evidence]]) -> str:
+    """论文里同一参数多处置不同值 -> 只作提示, 不判矛盾(挂在主结论的 note 上)。"""
+    desc = "；".join(f"{v} @ {ev.location}" for v, ev in distinct[:4])
+    more = f" 等 {len(distinct)} 处" if len(distinct) > 4 else ""
+    return (f"论文里 {disp} 有多处取值({desc}{more})，"
+            "分属不同章节/任务，已按不同实验场景分别处理，不判为矛盾")
+
+
+#: 「一个文件一套实验」的目录: 里面的多个文件各属一套配置, 不同值不是矛盾
+_ONE_CONFIG_PER_FILE = {"experiments", "experiment", "exps", "scripts", "script",
+                        "configs", "config", "cfgs", "options", "recipes",
+                        "benchmarks", "benchmark", "presets"}
+
+
+# 推理/导出/部署脚本: 它们的 batch size、精度本来就该和训练不同(推理常设 1),
+# 不参与"代码内部不一致"判定。实证 2026-10-29: CenterNet 的 sem_seg/train.py(24)
+# 与 sem_seg/batch_inference.py(1) 同目录, 被当成矛盾 —— 一个训练一个推理, 不是一回事。
+_INFER_PATH = re.compile(r"(^|[/\\_.\-])"
+                         r"(infer|inference|predict|export|deploy|serve|serving|onnx)",
+                         re.IGNORECASE)
+
+
+# 不代表「这次实验的实际取值」的代码证据, 不参与内部一致性核对:
+#   ① argparse / absl 的**默认值** —— 运行时会被命令行覆盖, 它不是最终配置;
+#   ② DataLoader 的 batch_size —— 数据加载参数, 不是训练超参。
+# 实证 2026-10-29(CenterNet): `add_argument('--batch_size', default=32)`、
+# `val_loader(..., batch_size=1)` 与 `opt.batch_size = 1` 被放在一起比, 判出"自相矛盾"。
+_NOT_FINAL_CFG = re.compile(
+    r"add_argument\s*\(|flags\.DEFINE|absl\.flags|argparse|"
+    r"\bdefault\s*=|DataLoader\s*\(|data_loader|dataloader|"
+    r"pin_memory|num_workers",
+    re.IGNORECASE)
+
+
+def _code_dir(ev: Evidence) -> tuple[str, str]:
+    """代码证据位置 -> (目录, 目录名)。"src/lib/opts.py:89" -> ("src/lib", "lib")。"""
+    path = (ev.location or "").split(":")[0].replace("\\", "/")
+    d = path.rsplit("/", 1)[0] if "/" in path else ""
+    return d, (d.rsplit("/", 1)[-1] if d else "")
+
+
+def _code_same_run(a: Evidence, b: Evidence) -> bool:
+    """两处代码取值会不会**在同一次运行里同时生效**(=真矛盾)。
+
+    判据(任一成立即"可能同时生效"):
+      1. 同一个文件 —— 后写的覆盖先写的, 铁定是配置被覆盖;
+      2. 同一目录, 且该目录不是「一个文件一套实验」的地方;
+      3. 都在压缩包根目录(平铺), 视为同一目录。
+    跨目录(如 `src/lib/opts.py` 与 `sem_seg/train.py`)、或落在 experiments/ 这类目录,
+    按"各自一套实验"处理 —— 值不同是应该的, 不该叫自相矛盾。
+    """
+    pa = (a.location or "").split(":")[0].replace("\\", "/")
+    pb = (b.location or "").split(":")[0].replace("\\", "/")
+    if pa == pb:
+        return True
+    da, na = _code_dir(a)
+    db, nb = _code_dir(b)
+    return da == db and na not in _ONE_CONFIG_PER_FILE
+
+
+def _multi_config_note(disp: str, distinct: list[tuple[Any, Evidence]]) -> str:
+    """代码里同一参数多处不同值、但分属不同实验 -> 只作提示, 不判矛盾。"""
+    desc = "；".join(f"{v} @ {ev.location}" for v, ev in distinct[:4])
+    more = f" 等 {len(distinct)} 处" if len(distinct) > 4 else ""
+    return (f"代码里 {disp} 在 {len(distinct)} 处有不同取值({desc}{more})，"
+            "分属不同目录/实验，按多套配置处理，不判为矛盾；复现时请指明实际运行的那一套")
+
+
 def _internal_conflict(key: str, disp: str, category: Category,
-                       hits: list[Evidence], side: str) -> Optional[Finding]:
+                       hits: list[Evidence], side: str
+                       ) -> tuple[Optional[Finding], str]:
     """同一载体(论文/代码)内部多处声明值不一致 -> 交叉审查发现。
+
+    返回 (发现, 提示文字), 至多一个非空:
+    - 论文侧: 只有两处**确实是同一套实验设置**(见 `_same_setting`)的两个不同取值才算矛盾;
+      分属不同章节/任务的多个取值只作提示, 由调用方挂到主结论上 ——「按任务分别给学习率」
+      是论文常规写法, 判成"自相矛盾"是错的(2026-10-29 人工标注: 该类错误 4/4)。
+    - 代码侧: 判据不变(同一文件内给了两个值, 通常是配置被覆盖)。测试/示例文件里的取值
+      不算"实现配置", 排除后仍矛盾才算; 分布在多个文件时降为低风险。
 
     side: "paper" | "code"
     出现在灵敏度/分组/扩展语境中的取值(有意为之)不参与判定。
-    分布在多个示例/教程文件时降为低风险(通常并非同一套实验配置)。
     """
     candidate = [ev for ev in hits if not ev.context_excluded]
     if side == "code":
-        # 测试/示例/教程文件中的取值不算"实现配置", 排除后仍矛盾才算内部不一致
+        # 测试/示例/教程文件中的取值不算"实现配置", 排除后仍矛盾才算内部不一致;
+        # 推理/导出脚本同理(推理批大小常设 1, 与训练不同不算矛盾)
         candidate = [ev for ev in candidate
-                     if not _AUX_PATH.search(ev.location) and "[cell" not in ev.location]
+                     if not _AUX_PATH.search(ev.location)
+                     and not _INFER_PATH.search(ev.location)
+                     and not _NOT_FINAL_CFG.search(ev.snippet or "")
+                     and "[cell" not in ev.location]
     distinct = _distinct_values(candidate)
     if len(distinct) < 2:
-        return None
-    first_val, first_ev = distinct[0]
-    others = [ev for _v, ev in distinct[1:]]
+        return (None, "")
+
+    # 论文看"是不是同一套实验设置", 代码看"会不会在同一次运行里同时生效"
+    same_run = _same_setting if side == "paper" else _code_same_run
+    soft_note = _multi_value_note if side == "paper" else _multi_config_note
+    clash = [(va, ea, vb, eb)
+             for i, (va, ea) in enumerate(distinct)
+             for vb, eb in distinct[i + 1:] if same_run(ea, eb)]
+    if not clash:
+        # 不是同一套设置、也不会同时生效 -> 只是"有多套取值", 出提示不判矛盾
+        return (None, soft_note(disp, distinct))
+    first_val, first_ev, _second_val, second_ev = clash[0]
+    others = [second_ev] + [ev for _v, ev in distinct
+                            if ev is not first_ev and ev is not second_ev]
     desc = "; ".join(f"{_v} @ {ev.location}" for _v, ev in distinct[:4])
     files = {ev.location.split(":")[0] for _v, ev in distinct}
     spread = len(files) > 1
     side_zh = "论文" if side == "paper" else "代码"
     note = f"{side_zh}内部多处声明互不一致: {desc}"
     if side == "paper":
-        note += "　(交叉审查自动核对, 若属灵敏度分析/分组实验请人工确认)"
+        note += "　(同页同章节、其余细节一致却给了两个值, 按矛盾处理; 请复核原文)"
     elif spread:
-        note += "　(分布在多个文件中, 可能并非同一套实验配置, 请人工确认)"
+        note += "　(同一目录下多个文件给了不同值, 可能入口脚本覆盖了配置文件; 请确认实际生效的那一套)"
     else:
         note += "　(同一文件内自相矛盾, 通常说明配置被覆盖)"
     risk, reason = assess_risk(Status.INTERNAL_INCONSISTENT, key, side=side,
                                same_file=not spread)
     if side == "paper":
-        return Finding(
+        return (Finding(
             param_key=key, display_name=disp, category=category,
             status=Status.INTERNAL_INCONSISTENT, confidence=Confidence.CONFIRMED,
             risk=risk, risk_reason=reason, paper=first_ev, extra=others[:3], note=note,
-        )
-    return Finding(
+        ), "")
+    return (Finding(
         param_key=key, display_name=disp, category=category,
         status=Status.INTERNAL_INCONSISTENT, confidence=Confidence.CONFIRMED,
         risk=risk, risk_reason=reason, code=first_ev, extra=others[:3], note=note,
-    )
+    ), "")
 
 
 def _align_param(key: str, paper: PaperInfo, code: CodeInfo,
-                 log: list[str]) -> list[Finding]:
-    """对齐单个参数: 内部一致性交叉核对 + 论文↔代码比对(两者都报, 不互相吞掉)。"""
+                 log: list[str], soft: Optional[list[str]] = None) -> list[Finding]:
+    """对齐单个参数: 内部一致性交叉核对 + 论文↔代码比对(两者都报, 不互相吞掉)。
+
+    soft: 非矛盾的提示(如"论文里该参数有多处取值"), 由调用方挂到本参数的主结论上。
+    """
     out: list[Finding] = []
     p_ev: Optional[Evidence] = paper.params.get(key)
     c_evs: list[Evidence] = code.params.get(key, [])
@@ -167,8 +316,12 @@ def _align_param(key: str, paper: PaperInfo, code: CodeInfo,
     p_hits: list[Evidence] = list(paper.params_all.get(key) or [])
     if p_ev and not p_hits:
         p_hits = [p_ev]
-    conf_p = _internal_conflict(key, disp, category, p_hits, "paper")
-    conf_c = _internal_conflict(key, disp, category, c_evs, "code")
+    conf_p, hint_p = _internal_conflict(key, disp, category, p_hits, "paper")
+    conf_c, hint_c = _internal_conflict(key, disp, category, c_evs, "code")
+    if soft is not None:
+        for _h in (hint_p, hint_c):
+            if _h:
+                soft.append(_h)
     if conf_p or conf_c:
         note = "；".join(x for x in [(conf_p.note if conf_p else ""),
                                      (conf_c.note if conf_c else "")] if x)
@@ -400,7 +553,16 @@ def align(paper: PaperInfo, code: CodeInfo, user_results: Optional[dict] = None)
         all_keys.add("seed")
 
     for key in sorted(all_keys):
-        result.findings.extend(_align_param(key, paper, code, log))
+        soft: list[str] = []
+        findings = _align_param(key, paper, code, log, soft)
+        if soft:
+            # 论文里"多处取值"只作提示: 挂到本参数的主结论上, 不再单列一条"内部不一致"
+            hint = "；".join(soft)
+            log.append(f"[内部核对] {key}: {hint}")
+            for f in findings:
+                if f.param_key == key:
+                    f.note = (f.note + "　" if f.note else "") + hint
+        result.findings.extend(findings)
 
     if user_results:
         result.findings.extend(_align_results(paper, user_results, log))

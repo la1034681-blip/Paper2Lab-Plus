@@ -118,8 +118,8 @@ try:
         browser = p.chromium.launch(channel="msedge", headless=True)
         page = browser.new_page(viewport={"width": 1500, "height": 1000})
         page.goto(URL, wait_until="domcontentloaded")
-        ok = wait_text(page, "使用内置演示数据")
-        check(ok, "首屏渲染出材料输入区（演示数据开关可见）")
+        ok = wait_text(page, "上传论文资料")
+        check(ok, "首屏渲染出材料输入区（「上传论文资料」可见）")
         check("访问口令" not in page.inner_text("body"),
               "未设 PAPER2LAB_ACCESS_CODE 时**不出现**口令门（本地零打扰）")
         browser.close()
@@ -135,7 +135,7 @@ try:
         page = browser.new_page(viewport={"width": 1500, "height": 1000})
         page.goto(URL, wait_until="domcontentloaded")
         check(wait_text(page, "访问口令"), "出现口令门（拿到链接 ≠ 能跑审计）")
-        check("使用内置演示数据" not in page.inner_text("body"),
+        check("上传论文资料" not in page.inner_text("body"),
               "未通过口令时**看不到**应用主体")
 
         # 错误口令
@@ -146,7 +146,7 @@ try:
         # 正确口令
         page.get_by_role("textbox").first.fill(CODE)
         page.get_by_text("进 入", exact=False).click()
-        check(wait_text(page, "使用内置演示数据", 45000), "口令正确后进入应用主体")
+        check(wait_text(page, "上传论文资料", 45000), "口令正确后进入应用主体")
         browser.close()
 finally:
     stop(proc)

@@ -30,8 +30,7 @@ if not d.exists():
 
 ur = json.loads((d / "results.json").read_text(encoding="utf-8")) \
     if (d / "results.json").exists() else None
-audit, _ = run_audit(str(d / "paper.pdf"), str(d / "code.zip"), ur,
-                     plan_mode=True, llm_planner=True, llm_patch=True)
+audit, _ = run_audit(str(d / "paper.pdf"), str(d / "code.zip"), ur, llm_planner=True, llm_patch=True)
 
 ex = audit.execution_log or {}
 plan = ex.get("plan") or {}

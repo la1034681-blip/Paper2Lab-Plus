@@ -5,9 +5,9 @@
 
 第二期（第一批）改造说明:
 各步骤的**实现**已搬进 `toolbox`（工具箱），本模块只负责**调度与执行**——
-- `plan_mode=False`（默认，经典模式）: 按固定全序执行全部工具，行为与改造前一致；
-- `plan_mode=True`（计划模式）: 先由 `planner` 按材料实际情况排计划，再交 `runner` 执行。
-两种模式调用的是**同一组工具函数**，不存在两套实现，因此不会代码漂移。
+2026-10-25 起只有一条路: 先由 `planner` 按材料实际情况排计划，再交 `runner` 执行。
+（原先的"经典模式 / 固定全序全跑"已按用户口径删除: 它会把"没有代码也扫一遍代码"
+  这种无效动作固化下来，让同一份材料的结论口径出现两条。现在口径唯一。）
 
 `STEPS` 由工具箱的工具顺序自动推导（节点/工具数随 `toolbox.TOOLS` 走，界面与报告都从它派生），
 界面既有的十步进度条与 `from paper2lab.pipeline import STEPS` 无需改动。
@@ -42,7 +42,8 @@ def run_audit(
     vision_budget_seconds: Optional[float] = None,
     enable_agent: bool = True,
     agent_budget: Optional[dict] = None,
-    plan_mode: bool = False,
+    # 2026-10-25 删除「经典模式」：不再有 plan_mode 参数。
+    # 现在一律"先排计划再执行"，由 llm_planner 决定是模型排还是规则版兜底。
     llm_planner: bool = False,
     llm_patch: bool = False,
     # 会话级复用(阶段三第1步): 同会话内第二次跑同一输入时, 跳过解析
@@ -52,28 +53,40 @@ def run_audit(
     #   不自己算: 只有 app.py 有 pdf_bytes+code_bytes, 这里只有路径,
     #   重读文件算指纹会污染性能。
     session_fp: str = "",
+    # 阶段三 3C：消融档位要「真跳过」的工具键（默认空 = 行为完全不变）。
+    # 只给评测用: 网页 / MCP / 命令行一律不传，所以对外行为零变化。
+    skip_tools: tuple = (),
+    # 2026-10-25：模型先判、程序后验（试点 ① 假设真假 / ③ 参数配对）。
+    # **默认 False = 行为完全不变**；开着才多两条模型调用，且规则结论照样独立跑。
+    judge_llm: bool = False,
+    # 2026-10-26 自主模式：② 实验站是否让模型挑计算工具（默认 False）。
+    # 模型**只能挑工具键**，输入一律由规则从材料里取（不造数）；挑不出合法键 → 回落规则版。
+    experiment_llm: bool = False,
 ) -> tuple:
     """执行完整审计, 返回 (AuditResult, Markdown 报告)。
 
     进度回调 `progress(i, name)` 在**第 i 步真正完成时**触发, 因此它既适合
     驱动进度条(名称即为已完成步骤), 也直接给出各步骤耗时。
-    计划模式下被跳过的步骤也会触发回调, 名称带「（计划跳过）」后缀。
+    被计划跳过的步骤也会触发回调, 名称带「（计划跳过）」后缀。
 
     enable_agent=False 可关掉"抽取 Agent"(第一期), 用于做消融对比。
-    plan_mode=True 启用"调度员排计划"(第二期第一批), 执行记录见
-    `audit.execution_log`。
-    llm_planner=True 让 **AI 排计划**（工具提议 + 程序盖章，见 planner._llm_refine）；
+    llm_planner=True 让 **模型全权排计划**（1C 起: 调不调工具由模型定、程序不设闸门，
+    见 planner._llm_plan；清单外的工具本次不存在）；False 则走**规则版兜底计划**。
+    **没有第三种模式了** —— 2026-10-25 按用户口径删掉了"经典模式 / 固定全序全跑"。
     llm_patch=True 让 **AI 给补丁提名目标**（提名必须落在已抽到的候选里，再由程序盖章，
     见 patch.propose_via_llm）。
     `llm_base_url` / `llm_model`：**模型 API 的端点与模型名**（2026-09-30 起页面可填），
     用于让用户换任意 OpenAI 兼容模型；留空则回落 .env / 环境变量 / DeepSeek 默认。
-    **本函数的默认值是 False**（CLI 与验证脚本需要可预测的确定性基线）；
-    **网页端默认 True** —— 界面就是 agent 入口：输入材料启动即由 AI 参与决定跑哪些环节
-    （见 app.py 的「AI 参与决策」开关）。**规则版永远是兜底**：
-    AI 不可用、想乱跳、提名越界，都会被程序挡回并留痕。
+    **规则版永远是兜底**：AI 不可用、想乱跳、提名越界，都会被程序挡回并留痕。
     `needs_index` / `snapshot` / `session_fp`（阶段三第1步）: 会话级复用三元组, 由 app.py
     的 T2 查得并传入; 同会话内第二次跑时跳过 PDF 解析与代码扫描。
     """
+    # 2026-10-30：路径校验放在最外侧。run_job 里每个工具都有 except Exception
+    # 兜底（单个工具出错不该拖垮全流程），于是坏路径会被记成「某一步失败」、
+    # 继续跑完、最后照样出结论 —— 用户会把「代码里没有这些参数」当成事实。
+    from .preflight import check_inputs as _check_inputs
+    _check_inputs(pdf_path, code_path)
+
     job = Job(
         fingerprint=_fingerprint(pdf_path, code_path),
         pdf_path=pdf_path,
@@ -96,14 +109,17 @@ def run_audit(
                        "budget_seconds": vision_budget_seconds},
         vision_max_regions=vision_max_regions,
         enable_agent=enable_agent,
+        skip_tools=tuple(skip_tools or ()),
         agent_budget=dict(agent_budget or {}),
         llm_planner=bool(llm_planner),
         llm_patch=bool(llm_patch),
+        judge_llm=bool(judge_llm),
+        experiment_llm=bool(experiment_llm),
         # 会话级复用(阶段三第1步): 同会话内第二次跑, 跳过解析
         needs_index=needs_index,
         snapshot=snapshot,
     )
-    run_job(job, progress=progress, plan_mode=plan_mode)
+    run_job(job, progress=progress)
 
     # 快路径(阶段三第1步): 若本轮是重解析, 把产物存进快照, 供下次复用。
     #   快照键优先用 session_fp(论文+code, 与 session_lookup 同源);

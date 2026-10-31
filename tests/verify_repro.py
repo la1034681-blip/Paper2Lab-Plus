@@ -15,7 +15,7 @@ ROOT = Path(r"C:\Users\lijiahui\Desktop\Paper2Lab测试集")
 d = ROOT / "05_ViT"
 ur = json.loads((d / "results.json").read_text(encoding="utf-8"))
 
-audit, _ = run_audit(str(d / "paper.pdf"), str(d / "code.zip"), ur, plan_mode=True)
+audit, _ = run_audit(str(d / "paper.pdf"), str(d / "code.zip"), ur)
 path = write_repro_pack(audit, str(ROOT / "REPRO_05_ViT.md"))
 pack = build_repro_pack(audit)
 
@@ -50,5 +50,8 @@ out.append("—— 抽样看几行对照表 ——")
 for p in pack.params[:5]:
     out.append(f"  {p['name']:<20} 论文={p['paper']:<12} 代码={p['code']:<12} {p['status_label']}")
 
-Path("_repro.txt").write_text("\n".join(out), encoding="utf-8")
+# 产物写到 .trash_tmp/，不在工程根目录留草稿（工作区卫生）
+_OUT = _pl.Path(__file__).resolve().parent.parent / ".trash_tmp"
+_OUT.mkdir(exist_ok=True)
+(_OUT / "_repro.txt").write_text("\n".join(out), encoding="utf-8")
 print("done")

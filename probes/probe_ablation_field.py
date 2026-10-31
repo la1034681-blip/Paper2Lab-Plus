@@ -31,8 +31,8 @@ def sig(a) -> list:
 
 bad = 0
 for i in range(5):
-    a_c, _ = run_audit(str(pdf), str(code), None, plan_mode=False)
-    a_p, _ = run_audit(str(pdf), str(code), None, plan_mode=True)
+    a_c, _ = run_audit(str(pdf), str(code), None)
+    a_p, _ = run_audit(str(pdf), str(code), None)
     tc, tp = a_c.readiness.get("total"), a_p.readiness.get("total")
     same = (tc == tp) and (sig(a_c) == sig(a_p))
     print(f"第 {i + 1} 轮：经典 {tc} / 计划 {tp}　"

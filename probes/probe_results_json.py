@@ -49,9 +49,9 @@ out.append(f"- results.json 内容: {RES}")
 out.append("")
 
 with_res, _ = run_audit(str(DEMO / "paper.pdf"), str(DEMO / "project.zip"),
-                        RES, force_mock=True, plan_mode=True)
+                        RES, force_mock=True)
 without_res, _ = run_audit(str(DEMO / "paper.pdf"), str(DEMO / "project.zip"),
-                           None, force_mock=True, plan_mode=True)
+                           None, force_mock=True)
 
 b1, b2 = brief(with_res), brief(without_res)
 

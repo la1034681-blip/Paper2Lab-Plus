@@ -46,7 +46,7 @@ for name, pdf, code, results_path in CASES:
 
     t0 = time.time()
     try:
-        audit, report = run_audit(str(pdf), str(code), ur, plan_mode=True)
+        audit, report = run_audit(str(pdf), str(code), ur)
     except Exception as e:                                   # noqa: BLE001
         out += [f"  ✗ 审计失败: {type(e).__name__}: {e}", ""]
         summary.append({"name": name, "err": f"{type(e).__name__}: {e}"})

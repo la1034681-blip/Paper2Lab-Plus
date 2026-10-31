@@ -27,13 +27,19 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
+# hero 上的「N 步」必须与**本地这份代码**的环节数一致 —— 不写死（2026-10-15 踩到：
+# 加了「假设生成」后本地 13 格、脚本还写死 12，推送后体检会突然变红）。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from paper2lab.toolbox import STEPS  # noqa: E402
+_EXPECT_STEPS = f"{len(STEPS)} 步"
+
 URL = "https://paper2lab.streamlit.app/"
 UPLOAD_PDF = Path(r"C:\Users\lijiahui\Desktop\Paper2Lab测试集\01_DDPM\paper.pdf")
 SHOTS = Path(r"C:\Users\lijiahui\Desktop\Paper2Lab测试集\ui_screenshots")
 
 APP_FRAME_MARK = "/~/+/"
 GATE_TEXT = "访问口令"
-MAIN_TEXT = "使用内置演示数据"
+MAIN_TEXT = "上传论文资料"
 RUN_TEXT = "开始科研审计"
 FP_RE = re.compile(r"数据指纹\s*([0-9a-fA-F]{4,})")
 
@@ -206,13 +212,13 @@ def main() -> int:
         hit, text, _ = wait_text(frame, [GATE_TEXT, MAIN_TEXT], 180_000)
         check("首屏渲染出内容", bool(hit), f"{time.time() - t0:.1f}s")
         check("标题正确", "Paper2Lab" in page.title(), page.title())
-        # hero 数字要**单独等**：首屏判据（"使用内置演示数据"）可能在 hero 之前就满足，
+        # hero 数字要**单独等**：首屏判据（"上传论文资料"）可能在 hero 之前就满足，
         # 直接拿那次取样判 hero 会假失败 —— 这个坑本会话已踩第三次。
         hero_hit, hero_text, hero_wait = wait_text(
-            frame, ["12 步", "{len(STEPS)}"], 30_000)
+            frame, [_EXPECT_STEPS, "{len(STEPS)}"], 30_000)
         if hero_text:
             text = hero_text          # 用更完整的这次取样做后续判定
-        check("hero 显示「12 步」（不是 {len(STEPS)}）", hero_hit == "12 步",
+        check(f"hero 显示「{_EXPECT_STEPS}」（不是未求值占位符）", hero_hit == _EXPECT_STEPS,
               f"命中 {hero_hit}（{hero_wait / 1000:.0f}s）" if hero_hit
               else "30s 内没等到 hero 数字")
         leaks = re.findall(r"\{[^{}\n]{1,60}\}", text or "")
@@ -240,10 +246,14 @@ def main() -> int:
         check("输入区用通用名「模型 API」且 Key/URL 成对",
               "模型 API Key" in adv and "模型 Base URL（必填）" in adv,
               "DeepSeek 专用名已升级为任意 OpenAI 兼容模型")
-        check("有「该模型本身可以读图（多模态）」开关",
-              "该模型本身可以读图" in adv, "")
+        # 2026-10-30：页面从「两组密钥 + 多模态勾选框」改成「一组密钥 + 按模型名自动识别」。
+        # 线上可能还是旧版（未推送），所以**两套文案都认** —— 只认新版会把旧版误判成回归。
+        check("多模态能力在页面上有明确交代（旧版勾选框 / 新版自动识别，任一套都算）",
+              ("该模型本身可以读图" in adv)
+              or ("已识别为多模态模型" in adv or "已识别为单模态模型" in adv), "")
         check("未配模型 API 时如实提示**无法读图**并说明原因",
-              "无法读图" in adv and ("未配置任何模型 API" in adv or "不支持读图" in adv),
+              ("无法读图" in adv or "本次不读图" in adv)
+              and ("未配置任何模型 API" in adv or "不支持读图" in adv),
               "不许把「没配」说成「已配置」，也不许静默跳过")
 
         html = frame.content()
@@ -334,7 +344,7 @@ def main() -> int:
                               if mf else (None, "", 0))
             check("手机视口首屏可渲染", bool(mhit),
                   f"{len(mtext)} 字" if mhit else "未渲染")
-            check("手机视口 hero 数字正常", "12 步" in (mtext or ""))
+            check("手机视口 hero 数字正常", _EXPECT_STEPS in (mtext or ""))
             m.screenshot(path=str(SHOTS / "L4_手机端.png"))
             m.close()
         except Exception as exc:  # noqa: BLE001

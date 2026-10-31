@@ -1,4 +1,4 @@
-"""角色层（阶段四）——三个独立 Agent，各只看自己该看的材料。
+"""角色层（阶段四 → 阶段一 1B 转正为七位置）——独立 Agent，各只看自己该看的材料。
 
 总纲 §6 锁死的生死线:
   上下文隔离 = 每个角色只看该看的，防污染、保独立性。
@@ -8,6 +8,14 @@
   Analyst   只读 job.paper（论文侧），碰不到 code
   Verifier  只读 job.code（代码侧），碰不到 paper
   Numeric   只读两侧已经抽好的值，不做任何抽取
+
+阶段一 1B 的口径变化（**只换名分与编制，不换行为**）:
+  对外统一讲**七个智能体协作** —— 解析·检索·主持·实验·计算·审查·撰写
+  （按出场序，见文件末尾 POSITIONS 编制表）。原来三个角色一个没废:
+    Analyst → 解析员 · 论文视野 ／ CodeVerifier → 解析员 · 代码视野
+    NumericVerifier → 计算员
+  也就是隔离**从角色边界下移到解析员内部**，一点没松。
+  执行体（Role 子类）与编制表（Position）刻意分开登记，两条线各自可改。
 
 为什么规则版也能叫"Agent":
   本文件是"角色接口 + 规则实现"。接口（__call__ 接收材料、产出结构化视图）
@@ -190,6 +198,116 @@ class NumericVerifier(Role):
 
 ROLES = (Analyst(), CodeVerifier(), NumericVerifier())
 ROLE_BY_NAME = {r.name: r for r in ROLES}
+
+
+# ---------------------------------------------------------------- 七位置团队（阶段一 · 1B）
+#
+# 为什么要有这一层:
+#   阶段四是「三个角色」—— 按**材料**分（只看论文 / 只看代码 / 只看值），
+#   回答的是"谁能看什么"。阶段一转正为「七个位置」—— 按**能力**分
+#   （读 / 搜 / 编排 / 做 / 算 / 审 / 写），回答的是"谁负责哪一段"。
+#   隔离没有丢，只是**从角色边界下移到解析员内部**: 解析员手里仍是两只
+#   互不通气的眼睛（论文视野 / 代码视野），仍是代码层强制，不靠提示词。
+#
+# 本层是**编制表**，不是新的执行体:
+#   能真跑的还是下面那些类 / 模块（Agent 契约不变、结论不变）；
+#   Position 只登记「出场序 / 能力 / 站 / 交接物 / 谁承载 / 现状」，
+#   给界面、文档、消融当**唯一口径来源** —— 之前"越改越乱"就是两套编号并行。
+#   落地节奏: 1B 只登记 ＋ 解析员 / 计算员改挂到新结构；其余五个位置的实现
+#   由 1C（主持）、2A 2B（假设 / 筛排）、2D（实验）、3A（具名工具）逐个接管。
+
+
+@dataclass(frozen=True)
+class Position:
+    """一个智能体位置的契约（阶段一 1B 定型）。
+
+    与执行体（Analyst / CodeVerifier / ...）的分工:
+      Position —— 编制表。出场序、能力、归属站、交接物、承载模块、现状。
+      Role     —— 执行体。真正被节点调用、真正产出视图的那一层。
+    两者分开的理由: 位置会随叙事变、承载模块会随分期换，
+    但"谁读什么、谁看不见什么"这条线不能跟着变 —— 登记与执行各自独立改。
+    """
+    key: str          # 英文键（留痕 / 消融用）
+    cn: str           # 中文名（对外统一口径）
+    capability: str   # 五能力中的哪一个: 读 / 搜 / 编排 / 做 / 算 / 审 / 写
+    station: str      # 归属站（贯穿全程 = 不固定在某站）
+    handoff: str      # 交出去的产物（协作方式 = 交接物驱动）
+    carrier: str      # 实现由谁承载
+    impl: str         # 现状: 复用 / 待改 / 待建
+
+
+POSITIONS: tuple = (
+    Position("parser", "解析员", "读", "① 假设",
+             "结构化线索 ＋ 疑点清单",
+             "Analyst（论文视野）/ CodeVerifier（代码视野）", "复用"),
+    Position("retriever", "检索员", "搜", "① 假设",
+             "带出处的值（论文页 / 代码 file:line）",
+             "retrieval.py", "复用"),
+    Position("moderator", "主持人", "编排", "贯穿全程",
+             "调用序列 / 排好序的假设卡",
+             "planner.py（规则兜底）＋ LLM 规划调度", "待改（1C）"),
+    Position("experimenter", "实验员", "做", "② 实验",
+             "实验卡（设计 ＋ 实跑记录 ＋ 实际值）",
+             "repro_plan.py + repro.py", "待改（2D）"),
+    Position("calculator", "计算员", "算", "② ③",
+             "实际值 / 独立复算结果",
+             "NumericVerifier ＋ compute.py", "复用"),
+    Position("reviewer", "审查员", "审", "③ 验证",
+             "判定卡（支持 / 推翻 / 待验 ＋ 证据出处）",
+             "collider.py + aligner.py + selfcheck.py", "复用"),
+    Position("writer", "撰写员", "写", "④ 迭代",
+             "发现报告 ＋ 修正建议",
+             "report.py + patch.py", "复用"),
+)
+POSITION_BY_KEY = {p.key: p for p in POSITIONS}
+
+# 编制表的防呆: 七个就是七个，多一个少一个都必须显式改这里（不靠文档数）
+assert len(POSITIONS) == 7, "七位置 —— 增删位置必须同步改 POSITIONS 与文档口径"
+assert len(POSITION_BY_KEY) == 7, "位置键必须唯一"
+
+
+class Parser(Role):
+    """解析员（读）: 内部两只眼睛 —— 论文视野 / 代码视野，互不通气。
+
+    与阶段四的差别**只在包装**:
+      阶段四: 节点里直接 new Analyst() + CodeVerifier()；
+      阶段一: 归到一个「解析员」名下，两只眼睛仍各读各的那一个字段。
+    隔离因此一点没松 —— 论文视野的入参里没有可用的 code 字段，
+    代码视野也拿不到 paper；模型版同样只喂本侧（见 canonicalize）。
+    """
+    name = "parser"
+
+    def __init__(self, llm: Optional["RoleLLM"] = None):
+        super().__init__(llm)
+        self.paper_eye = Analyst(llm)        # 论文视野（原 Analyst）
+        self.code_eye = CodeVerifier(llm)    # 代码视野（原 CodeVerifier）
+
+    def __call__(self, job: Any) -> dict:
+        paper_view = self.paper_eye(job)
+        code_view = self.code_eye(job)
+        # 数值侧只吃这两张已抽好的视图 —— 与阶段四接线同口径，未改
+        job.paper_view = paper_view
+        job.code_view = code_view
+        # 模型这次到底参没参与，两只眼睛各说各的，这里合并成一条留痕
+        self.last_note = "；".join(
+            n for n in (self.paper_eye.last_note, self.code_eye.last_note) if n)
+        return {"paper": paper_view, "code": code_view}
+
+
+class Calculator(Role):
+    """计算员（算）: 只对两侧已抽好的值做合理性检查，自己**不抽值**。
+
+    「下场真跑」（小规模复算 / 调具名工具）在 ② 实验站，由 compute.py 承担；
+    本类对应的是「不造数、只查数」的那一半 —— 行为与 NumericVerifier 一致。
+    """
+    name = "calculator"
+
+    def __init__(self, llm: Optional["RoleLLM"] = None):
+        super().__init__(llm)
+        self.numeric_eye = NumericVerifier()
+
+    def __call__(self, job: Any) -> NumericCheck:
+        return self.numeric_eye(job)
 
 
 # ---------------------------------------------------------------- 模型后端（可选）

@@ -8,12 +8,18 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+# ★ 本项跑的是**离线回归**，所以要显式关掉外部文献检索（4A）：
+#   它默认是开的（免费真实检索），一次要 5~11 秒且依赖外网。
+#   混合"网络抖动"进来，这个文件的结论就不再只反映程序本身了。
+os.environ["PAPER2LAB_LIT"] = "off"
 
 from paper2lab import graph, pipeline
 from paper2lab.graph import _PRECONDITIONS, gate
@@ -80,8 +86,9 @@ check(not (set(CLOSED_LOOP_NODES) & rec_m),
       "loop=False 时闭环四节点**不在** records 里（默认不动既有路径）")
 check(multi.execution_log.get("compute", {}) == {}, "loop=False 时 compute 为空")
 check(multi.execution_log.get("loop_enabled") is False, "loop_enabled 如实为 False")
-check(multi.execution_log.get("nodes_done") == 16,
-      "节点数仍为 16（阶段四原样）: %s" % multi.execution_log.get("nodes_done"))
+check(multi.execution_log.get("nodes_done") == len(TOOLS) + 6,
+      "节点数 = 工具数 + 6 个控制/哨兵节点（随 TOOLS 走, 不写死）: %s"
+      % multi.execution_log.get("nodes_done"))
 
 # ═══════════════════════════════════════ 2. 打开后四节点跑起来
 
@@ -92,8 +99,8 @@ for k in CLOSED_LOOP_NODES:
     check(k in rec_l, "节点 %s 出现在 records 里" % k)
     check(rec_l.get(k, {}).get("status") == "done", "节点 %s 状态为 done" % k)
 check(rec_l.get("compute", {}).get("gate") != "blocked", "compute 过了闸门")
-check(looped.execution_log.get("nodes_done") == 20,
-      "节点数 20 = 16 + 4: %s" % looped.execution_log.get("nodes_done"))
+check(looped.execution_log.get("nodes_done") == len(TOOLS) + 10,
+      "节点数 = 工具数 + 6 + 闭环四节点: %s" % looped.execution_log.get("nodes_done"))
 check(looped.execution_log.get("failed") == 0, "0 失败")
 check(looped.execution_log.get("errors") == [], "errors 为空")
 check(looped.execution_log.get("loop_enabled") is True, "loop_enabled 如实为 True")
@@ -117,7 +124,7 @@ check(cov.get("total", 0) > 0, "「搜」统计到结论总数 %s" % cov.get("to
 check(cov.get("cited", 0) == cov.get("total", 1),
       "demo 的每条结论都有可定位出处: %s/%s" % (cov.get("cited"), cov.get("total")))
 check(looped.citations.get("external", {}).get("enabled") is False,
-      "外部文献检索如实记为未启用（零成本配置）")
+      "外部检索在本项被显式关闭（PAPER2LAB_LIT=off），如实记为未启用")
 
 grade = looped.repro_plan.get("grade") or {}
 check(grade.get("level") in ("A", "B", "C", "D"), "「做」给出可复现性评级 %s" % grade.get("level"))
@@ -171,15 +178,15 @@ check([s["key"] for s in steps] == [s["key"] for s in steps_m],
       "进度槽清单与 loop=False 时**逐项相同**（新增链不改进度口径）")
 check(all(s["key"] in {t.key for t in TOOLS} for s in steps),
       "每条进度记录都对应一个真实工具（闭环节点确实没混进来）")
-# 阶段四既定的流向: analyze_code → 对撞区 → align → report_findings →（阶段五）→ selfcheck，
-# 因此多智能体图里 `llm_analyze` **不会执行**（进度条 9 项；classic 是 10 项）。
-# 这是既有事实，如实断言下来（不粉饰、也不在本轮擅自改动阶段四的行为契约）。
+# 通向 selfcheck 之前必须先过 `llm_analyze`：多智能体档曾漏跑归因，
+# 导致"结论里没有模型归因、进度条少一格"。修复后图版与经典版工具集合一致。
 _missing_tools = [t.key for t in TOOLS if t.key not in {s["key"] for s in steps}]
-check(_missing_tools == ["llm_analyze"],
-      "多智能体图按既定流向绕过 llm_analyze，进度条 9 项（差的就是它）: %s" % _missing_tools)
-check(len(steps_c) == len(TOOLS), "classic 走全部 10 个工具: %d" % len(steps_c))
-check(len(steps) == len(steps_c) - 1,
-      "多智能体图比 classic 少 1 项（正是 llm_analyze）: %d vs %d" % (len(steps), len(steps_c)))
+check(_missing_tools == [],
+      "多智能体图一个工具都不漏（含 llm_analyze）: 缺 %s" % _missing_tools)
+check(len(steps_c) == len(TOOLS),
+      "classic 进度条覆盖全部工具（跳过项也占槽）: %d" % len(steps_c))
+check(len(steps) == len(steps_c),
+      "多智能体图与 classic 进度条格数一致: %d vs %d" % (len(steps), len(steps_c)))
 check(all(s["status"] in ("done", "skipped", "failed") for s in steps),
       "每条进度记录状态取值合法（界面按这三个值渲染）")
 

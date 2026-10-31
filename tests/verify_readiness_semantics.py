@@ -55,7 +55,7 @@ for name, pdf, code, res_path in CASES:
         import json
         ur = json.loads(Path(res_path).read_text(encoding="utf-8"))
     audit, _ = run_audit(str(pdf), str(code) if Path(code).exists() else "",
-                         ur, force_mock=True, plan_mode=True)
+                         ur, force_mock=True)
     r = audit.readiness or {}
     cats = r.get("categories") or {}
     unv = r.get("unverified") or {}
@@ -146,7 +146,9 @@ else:
     out.append("2. 未提供实测结果的 7 套：结果一致性 + 实验记录完整度 均为「未核验」")
     out.append("3. 提供实测结果的 05_ViT：无任何未核验维度（对照组未受影响）")
 
-(HERE / "_ready_sem.txt").write_text("\n".join(out), encoding="utf-8")
+# 草稿写到 .trash_tmp/，不在工程根目录留临时文件（工作区卫生）
+(HERE / ".trash_tmp").mkdir(exist_ok=True)
+(HERE / ".trash_tmp/_ready_sem.txt").write_text("\n".join(out), encoding="utf-8")
 REPORT = ROOT / "readiness_unverified_report.md"
 REPORT.write_text("\n".join(out), encoding="utf-8")
 

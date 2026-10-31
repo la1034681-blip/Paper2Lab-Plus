@@ -1,0 +1,14 @@
+{
+  "schema_source": "SciEvalKit (InternScience) v1 / 2025-12",
+  "dataset": "Paper2Lab-AuditBench",
+  "agent": "paper2lab",
+  "model_version": "v1-parser-classic",
+  "summary": {
+    "parse_ok": 1.0,
+    "decoy_fp": 0.0,
+    "n_findings": 8.444444444444445,
+    "rejected": 0.0,
+    "recall": 1.0,
+    "n_miss": 0.0
+  }
+}

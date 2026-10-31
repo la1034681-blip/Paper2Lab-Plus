@@ -1,8 +1,12 @@
 """审计报告生成——Markdown 模板(浏览器打印即 PDF)。
 
 报告结构(含交叉审查章节):
-就绪度 -> 解析覆盖与可信度 -> 审计概览 -> 逐项详情 -> 解析拒收清单
--> 审计自检(证据自证) -> 附录(比较日志)
+就绪度 -> 解析覆盖与可信度 -> **① 假设站** -> 审计概览 -> 逐项详情 -> 解析拒收清单
+-> 审计自检(证据自证) -> 根因追查/补丁草案 -> 待确认问题 -> 附录(比较日志)
+
+「① 假设站」排在概览**之前**是刻意的: 四站叙事是「① 假设 → ③ 判定」,
+报告里也该先给"我们要验什么", 再给"验出来是什么"。它由 `_hypotheses_md` 生成,
+字段口径与界面同源（都只读 Hypothesis.to_dict()）。
 """
 
 from __future__ import annotations
@@ -139,8 +143,8 @@ def _finding_md(f: Finding) -> str:
         lines.append("- 代码侧取值由运行时变量决定, 静态分析无法给出确定值 → 标记为"
                      " **动态确定·无法静态验证**(不计入评分)")
     elif f.status == Status.INTERNAL_INCONSISTENT:
-        lines.append("- 同一载体内出现多个不同取值 → 标记为 **内部不一致**"
-                     "(灵敏度分析/分组实验为有意为之, 可忽略)")
+        lines.append("- 同一套实验设置里给了两个不同取值 → 标记为 **内部不一致**"
+                     "(论文须同页同章节; 代码须可能同时生效。按任务分别取值/分目录的各套配置不在此列)")
     elif f.status == Status.MISSING_IN_CODE:
         lines.append("- 论文侧有值、代码侧无证据 → 标记为 **代码未找到**(中风险, 需人工确认)")
     elif f.status == Status.MISSING_IN_PAPER:
@@ -170,6 +174,455 @@ def _finding_md(f: Finding) -> str:
     lines.append("---")
     lines.append("")
     return "\n".join(lines)
+
+
+def _hypotheses_md(audit: AuditResult) -> list[str]:
+    """① 假设站的章节（阶段二 2A 提出 ＋ 2B 推演筛排）。
+
+    为什么报告必须有这一节: 报告是**能带走的那一份**。界面上看得到假设卡、
+    导出的 .md 里没有, 等于"从查错转向发现"这个动作只活在网页上 ——
+    评审把报告打开时, 看到的还是旧的"逐项比对"体系。
+
+    口径与界面**同源**: 字段只读 `Hypothesis.to_dict()`（那里定义过一次）,
+    本函数不另写一套说法, 否则界面与报告迟早对不上。推演那一列同理 ——
+    判决与文案都来自卡片字段, 报告不做第二次判断。
+    """
+    cards = list(getattr(audit, "hypotheses", None) or [])
+    total = int(getattr(audit, "hypothesis_total", 0) or len(cards))
+    stats = dict(getattr(audit, "hypothesis_stats", None) or {})
+    head = f"## ① 假设站: {total} 条可证伪的待验假设"
+    if stats.get("total"):
+        bits = []
+        if stats.get("flagged"):
+            bits.append(f"{stats['flagged']} 条已定位为取值非法")
+        if stats.get("excluded"):
+            bits.append(f"{stats['excluded']} 条推演已排除")
+        bits.append(f"{stats['pending']} 条待验")
+        head += "　—　" + "、".join(bits)
+    out: list[str] = [
+        "---", "", head, "",
+        "> 这一节**不是结论**, 是研究的起点。逐项审计回答「两侧一不一样」; "
+        "这里回答「因此我们假设什么、以及看到什么就推翻它」。"
+        "**写不出推翻判据的话不会出现在这里** —— 不可证伪的不是假设, 是意见。", "",
+    ]
+    if stats.get("total"):
+        out += [f"> 推演引擎: {stats.get('engine', '—')}。动手之前先算一遍 —— "
+                "能算掉的先剔（推演已排除）、一侧写错的先标（已定位），省下实验的力气。", ""]
+    if not cards:
+        out += ["本次没有提出假设: 已抽取到的参数在论文与代码两侧没有值得追问的分歧。",
+                "（这不等于「全部通过」—— 判定见下面的审计概览。）", ""]
+        return out
+    if total > len(cards):
+        out += [f"共提出 {total} 条, 按「最该先验」排序后列出前 {len(cards)} 条。", ""]
+
+    rows = [h.to_dict() if hasattr(h, "to_dict") else dict(h) for h in cards]
+    out += ["| # | 参数 | 类型 | 推演判决 | 推演类型 | 需实机验证 | 排序分 |",
+            "| --- | --- | --- | --- | --- | --- | --- |"]
+    for d in rows:
+        out.append(f"| {d.get('rank')} | {d.get('key')} | {d.get('kind')} | "
+                   f"{d.get('verdict') or '—'} | {d.get('derivation_kind') or '—'} | "
+                   f"{'是' if d.get('needs_rerun') else '否'} | {d.get('score')} |")
+    out.append("")
+
+    for d in rows:
+        need = "必须实机验证" if d.get("needs_rerun") else "读代码即可定论"
+        out += [f"### #{d.get('rank')}　{d.get('key')} — {d.get('kind')}（{need}）", "",
+                f"- **待验陈述**: {d.get('claim')}",
+                f"- **要回答的问题**: {d.get('question')}",
+                f"- **怎么推翻它**: {d.get('falsifiable_by')}"]
+        sides: list[str] = []
+        if d.get("paper_value"):
+            sides.append(f"论文 `{d['paper_value']}`"
+                         + (f"（{d['paper_where']}）" if d.get("paper_where") else ""))
+        if d.get("code_value"):
+            sides.append(f"代码 `{d['code_value']}`"
+                         + (f"（{d['code_where']}）" if d.get("code_where") else ""))
+        if sides:
+            out.append("- **两侧取值**: " + "　｜　".join(sides))
+        if d.get("kind_desc"):
+            out.append(f"- **类型说明**: {d['kind_desc']}")
+        if d.get("derivation"):
+            kind = d.get("derivation_kind") or "推演"
+            out.append(f"- **推演判决（{d.get('verdict')} · {kind}）**: {d['derivation']}")
+        if d.get("why"):
+            out.append(f"- **为什么排在这个位置**: {d['why']}")
+        out.append("")
+    return out
+
+
+def _judge_md(audit: AuditResult) -> list[str]:
+    """模型先判、程序后验的**分歧留档**（2026-10-25）。
+
+    只在至少有一条模型判断时出现 —— 关着时不占版面（与 `judge_llm` 默认关同款口径）。
+
+    口径（必须写进报告, 这是评审最会追问的地方）:
+      · **结论以程序为准**: 规则判定可重算, 换个模型、换台机器都是同一个答案;
+      · **模型的话如实并存**: 不一致的条目两边都写, 不做静默取舍;
+      · 规则没算出结论、只有模型有说法的, 只能当**线索**, 不进结论段。
+    """
+    cards = list(getattr(audit, "hypotheses", None) or [])
+    finds = list(getattr(audit, "findings", None) or [])
+    h_rows = []
+    for c in cards:
+        d = c.to_dict() if hasattr(c, "to_dict") else dict(c)
+        if d.get("llm_verdict"):
+            h_rows.append(d)
+    f_rows = [f for f in finds if getattr(f, "llm_status", None) is not None]
+    if not h_rows and not f_rows:
+        return []
+
+    def _agree(v) -> str:
+        return "一致" if v is True else ("不一致" if v is False else "程序没结论")
+
+    out: list[str] = [
+        "---", "", "## 模型判断与程序复验", "",
+        "> 这一节回答「模型怎么看、程序怎么算、两边差在哪」。"
+        "**结论以程序为准** —— 规则判定可重算；模型的话如实并存，不做静默取舍。"
+        "程序没算出结论、只有模型有说法的，只能当**线索**，不进结论。", "",
+    ]
+
+    if h_rows:
+        n_dis = sum(1 for d in h_rows if d.get("llm_agree") is False)
+        out += [f"### 假设真假: 模型判了 {len(h_rows)} 条, 与程序不一致 {n_dis} 条", "",
+                "| 参数 | 模型说 | 程序算 | 比对 | 模型的理由 |",
+                "| --- | --- | --- | --- | --- |"]
+        for d in h_rows:
+            out.append(f"| {d.get('key')} | {d.get('llm_verdict')} | "
+                       f"{d.get('verdict') or '—'} | {_agree(d.get('llm_agree'))} | "
+                       f"{d.get('llm_why') or '—'} |")
+        out.append("")
+
+    if f_rows:
+        n_dis = sum(1 for f in f_rows if f.llm_agree is False)
+        out += [f"### 参数配对: 模型判了 {len(f_rows)} 条, 与程序不一致 {n_dis} 条", "",
+                "| 参数 | 模型说 | 程序算 | 比对 | 模型的理由 |",
+                "| --- | --- | --- | --- | --- |"]
+        for f in f_rows:
+            out.append(f"| {f.display_name} | {_STATUS_ZH[f.llm_status]} | "
+                       f"{_STATUS_ZH[f.status]} | {_agree(f.llm_agree)} | "
+                       f"{f.llm_why or '—'} |")
+        out.append("")
+
+    out += ["一条纪律: 两个说法**都留着** —— 只留一个，等于替读者做了他没授权的取舍。", ""]
+    return out
+
+
+def _impact_groups(audit: AuditResult) -> list:
+    """把「同一件事」的影响合并 —— 批大小卡与学习率卡算出来的是同一条。
+
+    为什么必须合并: 两张卡说的是同一个倍数（批大小变了 lr 该不该跟着变）, 分开列
+    读者会以为系统把一件事说了两遍, 或者以为漏了一张卡。合并时把两张卡的名字都写上。
+    """
+    groups: dict = {}
+    for h in (getattr(audit, "hypotheses", None) or []):
+        im = getattr(h, "impact", None) or {}
+        if not im:
+            continue
+        sig = "|".join(str(im.get(x, "")) for x in ("kind", "compares", "magnitude", "direction"))
+        g = groups.setdefault(sig, {"impact": im, "keys": []})
+        key = str(getattr(h, "key", "") or "")
+        if key and key not in g["keys"]:
+            g["keys"].append(key)
+    return list(groups.values())
+
+
+_KIND_IMPACT_ZH = {
+    "effective_batch": "等效批大小 → 学习率该不该跟着变",
+    "warmup": "预热步数该不该跟着批大小调整",
+}
+
+
+def _impact_md(audit: AuditResult) -> list[str]:
+    """① 假设站「算」这一步的**影响量级**章节（阶段二 2E）。
+
+    为什么单独成节: 逐项比对只说「两边不一样」, 读者不知道「不一样有多大后果」。
+    这一节回答五件事: 折成倍数是多少、方向朝哪、有几种合理解释、哪种证据最硬、
+    什么情况下影响归零、复现时该拿什么去对照。
+
+    三条边界写进正文（不只写在文档里）: 提示层 / 给区间不给点值 / 「证据最硬」不是「最优」。
+    """
+    groups = _impact_groups(audit)
+    if not groups:
+        return []
+    out: list[str] = [
+        "---", "",
+        f"## 影响量级: {len(groups)} 条可核算的影响（发现型假设）", "",
+        "> 这一节回答「找出来的差异**有多大后果**」。三条边界先写清楚，免得被当成结论：",
+        "> ① **提示层** —— 不进判定、不进评分、不改就绪度，推错也只是多一句话；",
+        "> ② **给区间不给点值** —— 批大小放大后学习率该放大几倍，业内有两派都算主流做法，",
+        ">    只报一个数等于替读者选边；",
+        "> ③ **「证据最硬」不是「最优」** —— 优不优要跑训练比准确率，本项目不跑训练；",
+        ">    这里排的是「哪个解释证据更硬」，四项加减分都能当场重算。", "",
+    ]
+
+    for i, g in enumerate(groups, start=1):
+        im = g["impact"]
+        kind_zh = _KIND_IMPACT_ZH.get(str(im.get("kind", "")), str(im.get("kind", "")))
+        out += [f"### 影响 {i}　{'、'.join(g['keys'])} — {kind_zh}", ""]
+        out.append(f"- **比的是什么**: {im.get('compares') or '—'}"
+                   f"（倍数 `{im.get('magnitude')}`）")
+        out.append(f"- **方向**: {im.get('direction') or '不标方向（落在两派区间内，没有可指的方向）'}")
+        out.append(f"- **依据的规则**: {im.get('rule') or '—'}")
+        if im.get("formulas"):
+            out.append("- **算式（可手工复算）**:")
+            out += [f"  - `{f}`" for f in im["formulas"]]
+        if im.get("given"):
+            out.append("- **取数口径**:")
+            for v in im["given"]:
+                note = f"（{v['note']}）" if v.get("note") else ""
+                out.append(f"  - {v['side']} `{v['key']} = {v['value']}`{note}")
+        if im.get("note"):
+            out.append(f"- **必须一起看的不确定性**: {im['note']}")
+        if im.get("sources"):
+            out += [f"- **出处**: {s}" for s in im["sources"]]
+
+        cands = list(im.get("candidates") or [])
+        if cands:
+            out += ["", "**候选解释（按证据硬度排序，不是「最优」）**", "",
+                    "| 序 | 读法 | 应有倍数（两派区间） | 冲突是否消失 | 证据分 |",
+                    "| --- | --- | --- | --- | --- |"]
+            for c in cands:
+                out.append(f"| {c.get('rank')} | {c.get('reading')} | "
+                           f"{c.get('quantity') or ''} {c.get('implied')} 倍 | "
+                           f"{'是' if c.get('resolves') else '否'} | {c.get('score')} |")
+            out.append("")
+            for c in cands:
+                if c.get("rank") != 1:
+                    continue
+                out.append(f"- **证据最硬的一条（第 1 顺位）**: {c.get('reading')}")
+                for p in c.get("parts") or []:
+                    out.append(f"  - {p['item']} {int(p['delta']):+d}：{p['why']}")
+            others = [c for c in cands if c.get("rank") != 1]
+            for c in others:
+                out.append(f"- 第 {c.get('rank')} 顺位: {c.get('reading')}"
+                           f"（{c.get('score')} 分）")
+            out.append("")
+
+        if im.get("flip"):
+            out.append("**翻盘算：哪个输入一变，结论就反过来**")
+            for f in im["flip"]:
+                out.append(f"- {f['input']}：{f['now']} → {f['if_changed']}；{f['effect']}")
+            out.append("")
+        else:
+            # 空着不写会让人以为「没做这一步」。四项核算是承诺, 空的也要说清为什么空。
+            out += ["**翻盘算：本次没有会让结论反转的输入**"
+                    "（口径无歧义，梯度累积也没有改变倍数）", ""]
+        if im.get("zero_when"):
+            out.append("**边界算：什么条件下影响归零**")
+            out += [f"- {z}" for z in im["zero_when"]]
+            out.append("")
+
+        ag = im.get("against") or {}
+        if ag.get("available"):
+            where = f"，{ag['where']}" if ag.get("where") else ""
+            out += ["**对照算：复现时该看到什么**",
+                    f"- 对照基准: 论文报告的 {ag['metric']} = `{ag['paper_value']}`{where}",
+                    f"- 预期现象: {ag['predict']}",
+                    f"- 同向怎么办: {ag['if_match']}",
+                    f"- 反向怎么办: {ag['if_opposite']}",
+                    f"- ⚠ {ag['note']}", ""]
+        else:
+            out += ["**对照算: 本次做不了**", f"- {ag.get('why') or '缺可比的结果指标'}", ""]
+
+    out += [f"> 口径提示: {groups[0]['impact'].get('scope') or ''}", ""]
+    return out
+
+
+def _figures_md(audit: AuditResult) -> list[str]:
+    """① 假设站「读」这一步的**图表线索**章节（阶段二 2E）。
+
+    为什么单独成节: 报告若只写"参数对不上", 读者不知道系统**看过图没有**。
+    这一节如实交代两件事: ① 论文图注原文摘录（逐字, 出处是页码）;
+    ② 有视觉通道时读到的图上可见信息（坐标轴 / 趋势 / 峰位 / 图例）。
+    **不写结论** —— 不做化合物鉴定、不推断机理, 出现解释性表述的线索在采信前就被丢了。
+    """
+    clues = list(getattr(audit, "figure_clues", None) or [])
+    total = int(getattr(audit, "figure_total", 0) or len(clues))
+    st = getattr(audit, "figure_stats", None) or {}
+    out: list[str] = [
+        "---", "", f"## 图表线索: {total} 条（图注原文 ＋ 图上可见信息）", "",
+        "> 这一节回答「**论文里的图到底画了什么**」: 图注逐字摘录 ＋ 图上看得见的",
+        "> 坐标轴 / 趋势 / 峰位 / 图例 / 标注值。**不做鉴定、不推断机理、不写结论**;",
+        "> 读不出的就说读不出, 不补数 —— 判定仍归 ③ 验证站。", "",
+    ]
+    if not clues:
+        out += ["本次没有读到图表线索 —— 论文正文里没找到独立成行的图注"
+                "（也可能本就不含图注/图）。", ""]
+        for n in (st.get("notes") or []):
+            out += [f"> {n}", ""]
+        return out
+
+    rows = [c.to_dict() if hasattr(c, "to_dict") else dict(c) for c in clues]
+
+    def _cell(v) -> str:
+        return str(v if v is not None else "—").replace("|", "／").replace("\n", " ")
+
+    kinds = st.get("kinds") or {}
+    if kinds:
+        bits = "　｜　".join(f"{k} {v}" for k, v in kinds.items())
+        out += [f"**图种类分布**: {bits}", ""]
+    src = []
+    if st.get("captions"):
+        src.append(f"图注原文 {st['captions']} 条")
+    if st.get("vision"):
+        src.append(f"读图 {st['vision']} 条（两次独立读取取交集）")
+    if src:
+        out += [f"**来源**: {'　｜　'.join(src)}　·　引擎: {st.get('engine', '—')}", ""]
+    if total > len(clues):
+        out += [f"共读到 {total} 条, 下面列出前 {len(clues)} 条。", ""]
+
+    out += ["| # | 图 | 线索类型 | 内容（看得见的） | 图上依据 | 出处 |",
+            "| --- | --- | --- | --- | --- | --- |"]
+    for d in rows:
+        out.append(f"| {_cell(d.get('rank'))} | {_cell(d.get('figure'))} | "
+                   f"{_cell(d.get('clue_type'))} | {_cell(d.get('statement'))} | "
+                   f"{_cell(d.get('anchor'))} | {_cell(d.get('page_ref'))} |")
+    out.append("")
+    for n in (st.get("notes") or []):
+        out += [f"> {n}", ""]
+    return out
+
+
+def _chem_md(audit: AuditResult) -> list[str]:
+    """① 假设站「读」这一步的**化学身份核验**章节（阶段二 2E-化学）。
+
+    为什么单独成节: 化学论文里"分子式 ↔ 分子量"是一组**确定性**关系 —— 算得出来、
+    对得上就对得上。这一节把"论文声称的化学身份"和"按原子量复算的结果"摆在一起,
+    对不上的地方直接标出来（CAS 校验位、SMILES 语法坏、分子式与分子量不符）。
+
+    **边界**: 本系统不从图像像素猜分子结构, 也不给化合物命名;
+    它只核对论文**自己写的**式子 / 编号 / 质量是否自洽。
+    """
+    from . import chem
+
+    items = list(getattr(audit, "chem_items", None) or [])
+    total = int(getattr(audit, "chem_total", 0) or len(items))
+    st = getattr(audit, "chem_stats", None) or {}
+    fallback = bool(getattr(audit, "chem_fallback", False))
+    out: list[str] = [
+        "---", "", f"## 化学身份核验: {total} 条（分子式 / CAS / SMILES / 分子量）", "",
+        "> 这一节回答「**论文写的化学身份自洽吗**」: 分子式按内置 IUPAC 原子量复算分子量,",
+        "> CAS 号按校验位算法验, SMILES 做语法体检, 再与论文声明的数对账。",
+        "> **判据取作者自己的精度**: 论文写 180.16 就按两位小数舍入后比较, 不另设阈值。",
+        "> **不从图像像素猜分子结构、不给化合物命名** —— 认结构靠猜, 对账靠算。", "",
+    ]
+    # 如实留痕：这批结果不是模型主动跑出来的，而是它跳过该步后由程序补算的。
+    # 跳过本身允许（调度权在模型），但**不许结果静默消失**，也不许把"跳过"读成"论文里没有"。
+    if fallback and items:
+        out += ["> ⚠ 本次规划**跳过了「化学身份核验」这一步**，以下 {n} 条是程序在生成报告前"
+                "按「免费且必做」口径补算的 —— 结论有效，但这步的跳过已如实记录。".format(n=total),
+                ""]
+    if not items:
+        out += ["本次没有抽到化学身份记录 —— 正文里没有分子式 / CAS / SMILES / 分子量声明"
+                "（非化学领域论文属正常）。", ""]
+        for n in (st.get("notes") or []):
+            out += [f"> {n}", ""]
+        return out
+
+    rows = [c.to_dict() if hasattr(c, "to_dict") else dict(c) for c in items]
+    summary = chem.summarize(items, st)
+
+    def _cell(v) -> str:
+        return str(v if v is not None else "—").replace("|", "／").replace("\n", " ")
+
+    kinds = summary.get("by_kind") or {}
+    if kinds:
+        out += [f"**类型分布**: {'　｜　'.join(f'{k} {v}' for k, v in kinds.items())}", ""]
+    by = summary.get("by_status") or {}
+    if by:
+        bits = "　｜　".join(f"{chem.STATUS_ZH.get(k, k)} {v}" for k, v in by.items())
+        out += [f"**判定**: {bits}　·　可判定 {summary.get('checked', 0)} 条，"
+                f"其中对不上 / 不合规 **{summary.get('bad', 0)}** 条", ""]
+    out += [f"**引擎**: {st.get('engine', chem.engine_name())}", ""]
+    if total > len(items):
+        out += [f"共抽到 {total} 条, 下面列出前 {len(items)} 条。", ""]
+
+    out += ["| # | 类型 | 论文原文 | 页 | 判定 | 依据（算出来的数） |",
+            "| --- | --- | --- | --- | --- | --- |"]
+    for d in rows:
+        status = chem.STATUS_ZH.get(d.get("status"), d.get("status"))
+        out.append(f"| {_cell(d.get('rank'))} | {_cell(d.get('kind'))} | "
+                   f"`{_cell(d.get('value'))}` | {_cell(d.get('page'))} | "
+                   f"{_cell(status)} | {_cell(d.get('detail'))[:160]} |")
+    out.append("")
+    for n in (st.get("notes") or []):
+        out += [f"> {n}", ""]
+    return out
+
+
+def _experiments_md(audit: AuditResult) -> list[str]:
+    """② 实验站的章节（阶段二 2D）。
+
+    为什么报告里必须有这一节: ② 站的产物是**一份实验记录**（设计 ＋ 真跑 ＋ 实际值）。
+    它若只活在网页上, 评审打开报告时看到的还是"提了假设 → 给了判定"两段 ——
+    中间"我们真的动手算过、这是算的过程"这一环就断了。报告是**能带走的那一份**。
+
+    口径与界面**同源**: 字段只读 `ExperimentCard.to_dict()`（那里定义过一次）,
+    本函数不另写一套说法, 否则界面与报告迟早对不上。
+    """
+    cards = list(getattr(audit, "experiments", None) or [])
+    total = int(getattr(audit, "experiment_total", 0) or len(cards))
+    st = getattr(audit, "experiment_stats", None) or {}
+    out: list[str] = [
+        "---", "", f"## ② 实验站: {total} 个实验（设计与真跑）", "",
+        "> ① 站回答「我们怀疑什么」; 这一节回答「**那怎么验**」—— 而且**真的算了**:",
+        "> 每一步都留下调用的工具、喂进去的输入、算出来的结果与耗时, 可以照着复现。",
+        "> **不执行任何训练、不运行用户代码**; 小规模复算一律走算术白名单。",
+        "> ② 站只负责**测**, 不下「假设成立 / 不成立」的判定 —— 判定是 ③ 站的事。", "",
+    ]
+    if not cards:
+        out += ["本次没有做实验: 没有可设计的假设卡（① 站没提出假设）, 或实验站点被跳过。", ""]
+        return out
+    if st:
+        bits = []
+        for label, key in (("复算对不上", "disagree"), ("需实机验证", "machine"),
+                           ("实测量·不下结论", "measured"), ("复算一致", "agree"),
+                           ("算不出来", "undecided"), ("无需实验", "no_need")):
+            if st.get(key):
+                bits.append(f"{label} {st[key]}")
+        if bits:
+            out += ["**结果分布**: " + "　｜　".join(bits), ""]
+        if st.get("calls"):
+            tools = "、".join(st.get("tools") or []) or "—"
+            out += [f"**真跑**: 共调用计算工具 {st['calls']} 次, 用到 {tools}; "
+                    f"引擎 {st.get('engine', '—')}（合计 {float(st.get('seconds') or 0):g} 秒）", ""]
+    if total > len(cards):
+        out += [f"共设计 {total} 个实验, 下面列出前 {len(cards)} 个。", ""]
+
+    rows = [c.to_dict() if hasattr(c, "to_dict") else dict(c) for c in cards]
+
+    def _cell(v) -> str:
+        # 表格里的单元格绝不能带竖线（会把表格切碎）—— 与 app.py 的 _cell 同一个理由
+        return str(v if v is not None else "—").replace("|", "／").replace("\n", " ")
+
+    # 列名用「实测结果」而不是「实际值」: 这一栏里既有复算出的比值、也有区间核查的结论,
+    # 笼统叫"实际值"会让人以为每个数都是同一种东西（下面是逐卡的完整来源说明）。
+    out += ["| # | 参数 | 观察结果 | 调用的工具 | 实测结果 |", "| --- | --- | --- | --- | --- |"]
+    for d in rows:
+        tools = " → ".join(d.get("tool_path") or []) or "—"
+        out.append(f"| {_cell(d.get('rank'))} | {_cell(d.get('key'))} | {_cell(d.get('status'))} | "
+                   f"`{_cell(tools)}` | {_cell(d.get('actual'))} |")
+    out.append("")
+
+    for d in rows:
+        out += [f"### #{_cell(d.get('rank'))}　{d.get('key')} — {d.get('status')}", "",
+                f"- **待验陈述**: {d.get('claim')}",
+                f"- **实验设计**: {d.get('design')}"]
+        recs = d.get("records") or []
+        if recs:
+            out.append("- **真跑记录**（可照着复现）:")
+            for r in recs:
+                ok = "✓" if r.get("ok") else "×"
+                out.append(f"  - {ok} `{r.get('tool')}` {r.get('name')}｜"
+                           f"输入 `{_cell(r.get('inputs'))}`｜{r.get('output')}｜{r.get('ms')} ms")
+        if d.get("actual") is not None or d.get("expected") is not None:
+            out.append(f"- **预期值**: {_cell(d.get('expected'))}　← {d.get('expected_from')}")
+            out.append(f"- **实际值**: {_cell(d.get('actual'))}　← {d.get('actual_from')}")
+        if d.get("rerun_plan"):
+            out.append(f"- **实机方案**: {d['rerun_plan']}")
+        out.append(f"- **谁挑的工具路径**: {_cell(d.get('plan_reason'))}")
+        out.append("")
+    return out
 
 
 def generate_report(audit: AuditResult) -> str:
@@ -345,6 +798,23 @@ def generate_report(audit: AuditResult) -> str:
             parts.append(f"- `{u['file']}` ({u['lang']})")
         parts.append("")
 
+    # ---- ① 假设站（阶段二 2A）
+    #      放在「审计概览」之前: 四站叙事是「① 假设 → ③ 判定」,
+    #      报告里也应先给"我们要验什么", 再给"验出来是什么"。
+    #      2E 的图表线索是「读」这一步的产物, 排在假设卡**之前**（先看图, 再提假设）。
+    parts += _figures_md(audit)
+    # 2E-化学：同一件「读」工序的第二类产物（分子式 / CAS / SMILES / 分子量对账）
+    parts += _chem_md(audit)
+    parts += _hypotheses_md(audit)
+    # 2026-10-25：模型先判、程序后验的**分歧留档**（关着时本函数返回空，不占版面）。
+    # 排在假设卡之后、影响量级之前: 先看「要验什么」, 再看「两边各怎么说」。
+    parts += _judge_md(audit)
+    # 2E：假设站「算」的产物 —— 影响量级 / 候选解释 / 翻盘 / 边界 / 对照。
+    # 排在假设卡之后: 先说要验什么, 再说"如果成立后果有多大"。
+    parts += _impact_md(audit)
+    # 阶段二 2D：② 实验站（就排在 ① 假设站之后 —— 四站的顺序: 提假设 → 做实验 → 判定）
+    parts += _experiments_md(audit)
+
     # ---- 审计概览
     parts += [
         "---",
@@ -425,8 +895,11 @@ def generate_report(audit: AuditResult) -> str:
     # ---- 执行计划与跨任务记忆(第二期)
     ex = getattr(audit, "execution_log", None) or {}
     if ex:
-        _mode = ("计划模式(调度员按材料排计划)" if ex.get("mode") == "planned"
-                 else "经典模式(固定全序执行)")
+        # 2026-10-25 删掉「经典模式」后只剩一条路：先排计划再执行。
+        # 这里如实区分**谁排的计划**（模型 / 规则版兜底），不再有"固定全序"这种说法。
+        _by = ((ex.get("plan") or {}).get("planner") or "rule")
+        _mode = ("模型排计划（全权调度，程序不设闸门）" if _by == "llm"
+                 else "规则版计划（模型未参与，按材料事实排）")
         parts += ["---", "", "## 执行计划", "",
                   f"- 执行模式: **{_mode}**",
                   f"- 执行 {ex.get('ran', 0)} 个工具 / 跳过 {ex.get('skipped', 0)} 个 / "
@@ -469,6 +942,25 @@ def generate_report(audit: AuditResult) -> str:
                   + f"，处理 {_vsh.get('total')} 个区域，耗时 {_vsh.get('seconds')}s"
                   + (f"，失败 {_vsh.get('failed')} 个" if _vsh.get("failed") else "")
                   + "。每个区域仍是**两次独立读图取交集**，区域顺序与结果均保序。", ""]
+
+    # ---- 外部文献候选（4A）: 真实存在、可点开核，但**不是结论的证据**
+    # 只在真查到东西时才写这一段 —— 没查到就不占篇幅（界面那边会如实说"没检索到"）。
+    _ext = (getattr(audit, "citations", None) or {}).get("external") or {}
+    _lit = _ext.get("items") or []
+    if _lit:
+        parts += ["---", "", f"## 外部文献候选({len(_lit)} 条, 均未核验)", "",
+                  "> 这些是在 6 个公开学术索引(OpenAlex / Crossref / Europe PMC / arXiv /"
+                  " DataCite / DOAJ)里查到的**真实记录**，点开 DOI 就能核。",
+                  "> 但它们与结论只有**关键词层面的相关** —— 「这篇文献是否支持某条结论」"
+                  "机器不判，引用前请自己读摘要。", "",
+                  "| 年份 | 标题 | 收录库 | 链接 |", "| --- | --- | --- | --- |"]
+        for _it in _lit[:10]:
+            _title = str(_it.get("title") or "").replace("|", "／")[:90]
+            _link = (f"[{_it['doi']}](https://doi.org/{_it['doi']})"
+                     if _it.get("doi") else (_it.get("url") or "—"))
+            parts.append(f"| {_it.get('year') or '—'} | {_title} | "
+                         f"{'、'.join(_it.get('found_in') or []) or '—'} | {_link} |")
+        parts.append("")
 
     # ---- 待确认问题(第二期第二批): 把"系统说不清的地方"交回给用户
     try:

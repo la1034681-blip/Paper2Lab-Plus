@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 from paper2lab.models import Status
-from paper2lab.pipeline import run_audit
+from paper2lab.pipeline import STEPS, run_audit
 
 BASE = Path(__file__).resolve().parent.parent
 
@@ -33,7 +33,8 @@ def main():
         user_results = json.loads((BASE / "demo" / "results.json").read_text(encoding="utf-8"))
 
     def on_progress(i, name):
-        print(f"  [{i + 1}/7] {name}")
+        # 分母**从 STEPS 派生**，不写死: 写死 7 时实际 15 个环节，日志会出现 [8/7]…[15/7]。
+        print(f"  [{i + 1}/{len(STEPS)}] {name}")
 
     audit, report_md = run_audit(pdf_path, code_path, user_results,
                                  force_mock=True, progress=on_progress)

@@ -26,7 +26,7 @@ for d in sorted(p for p in ROOT.iterdir() if p.is_dir() and not p.name.startswit
     if not (pdf.exists() and code.exists()):
         continue
     ur = json.loads(res.read_text(encoding="utf-8")) if res.exists() else None
-    audit, _ = run_audit(str(pdf), str(code), ur, plan_mode=True,
+    audit, _ = run_audit(str(pdf), str(code), ur,
                          force_mock=True)     # 取值与 LLM 无关, 用 mock 提速
     out.append(f"## {d.name}")
     out.append("")

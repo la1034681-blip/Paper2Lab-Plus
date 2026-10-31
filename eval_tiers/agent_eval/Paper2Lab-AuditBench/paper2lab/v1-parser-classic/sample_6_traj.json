@@ -1,0 +1,5 @@
+{
+  "success": true,
+  "final_answer": "{\"schema\": \"p2l-audit-answer-v1\", \"sid\": \"D题\", \"ok\": true, \"found_params\": {\"paper\": [\"depth_est\", \"kill_radius\", \"min_depth\", \"num_bombs\", \"sigma_xy\", \"sigma_z\"], \"code\": [\"depth_est\", \"kill_radius\", \"min_depth\", \"num_bombs\", \"sigma_xy\", \"sigma_z\"]}, \"inconsistencies\": [{\"param_key\": \"seed\", \"display\": \"Random Seed\", \"status\": \"missing_in_paper\", \"risk\": \"low\", \"verified\": null, \"paper\": null, \"code\": \"2026\", \"extra\": 0}], \"selfcheck\": {\"passed\": 0, \"checked\": 0, \"failed\": 0, \"skipped\": true}, \"readiness\": null, \"coverage\": {\"confidence_level\": null, \"confidence_score\": null, \"rejected\": 0}, \"stats\": {\"n_params_paper\": 6, \"n_params_code\": 6, \"n_hypotheses\": 0, \"n_experiments\": 0, \"n_calc\": 0, \"n_judged\": 0}, \"elapsed_s\": 2.131, \"tier\": \"parser\", \"tier_title\": \"只开解析员\", \"stations_open\": [\"① 假设\"], \"metrics_available\": [\"recall\", \"decoy_fp\", \"n_findings\", \"parse_ok\"], \"mode\": \"classic\"}",
+  "steps": []
+}

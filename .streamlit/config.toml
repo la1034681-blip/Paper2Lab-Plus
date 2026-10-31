@@ -1,9 +1,17 @@
 # Streamlit 运行配置（本地与云端共用）
-# 刻意保持"最保守": 不设任何会改变观感的主题项 —— 云端跑出来的样子必须与本地一致，
-# 否则你会遇到"本地好看、线上变了"的尴尬。base=light 是 Streamlit 的默认值，写上只为显式。
+# 刻意保持"最保守": 只固定一组颜色，不随系统深浅色切换 —— 云端跑出来的样子必须
+# 与本地一致，否则你会遇到"本地好看、线上变了"的尴尬。
+#
+# 2026-10-26 UI 改版：把原生组件的主色从 Streamlit 默认的红色改成墨蓝 #12203a，
+# 与页面主色一致（原来那排开关是刺眼的红，像告警）。改这一项会同时影响
+# toggle / slider / checkbox 这些原生控件 —— 它们是组件库画的，CSS 改不动。
 
 [theme]
 base = "light"
+primaryColor = "#12203a"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f6f8fb"
+textColor = "#1b2436"
 
 [server]
 headless = true

@@ -100,7 +100,7 @@ for name, pdf in [("01_DDPM", ROOT / "01_DDPM/paper.pdf"),
 
 print("③ D题: 种子不得被误补回")
 a, _ = run_audit(str(HERE / "demo/D题论文.pdf"), str(HERE / "demo/D题代码.zip"),
-                 None, force_mock=True, plan_mode=True)
+                 None, force_mock=True)
 filled = (a.paper.agent_meta or {}).get("filled") or {}
 seeds = [f for f in a.findings if f.param_key in ("seed", "random_seed")]
 paper_vals = [f.paper.raw_value for f in seeds if f.paper]
@@ -124,8 +124,15 @@ if not _effective:
     print("     （记忆库暂无有效条目，跳过）")
 else:
     _bad: list[str] = []
+    # 自由文本字段: 这些是论文原文/说明文字, 里面出现小数不代表记忆里存了参数取值。
+    # 实证 2026-10-29: 某篇论文标题带 arXiv 编号「arXiv:1607.01759v3」, 被这条规则
+    # 当成"疑似取值"报红 —— 误报的守卫最后只会被人关掉, 所以按字段名放行。
+    _FREE_TEXT = {"title", "abstract", "note", "notes", "snippet", "keywords",
+                  "sections", "headings", "reason", "why", "summary"}
 
-    def _walk(o, path: str = "") -> None:
+    def _walk(o, path: str = "", key: str = "") -> None:
+        if key in _FREE_TEXT and isinstance(o, (str, list)):
+            return
         if isinstance(o, bool):
             return
         if isinstance(o, float):                     # 浮点数 = 参数取值的典型形态
@@ -137,10 +144,10 @@ else:
                 _bad.append(f"{path} 字符串里含小数 {o!r}")
         elif isinstance(o, dict):
             for k, v in o.items():
-                _walk(v, f"{path}.{k}")
+                _walk(v, f"{path}.{k}", k)
         elif isinstance(o, list):
             for i, v in enumerate(o):
-                _walk(v, f"{path}[{i}]")
+                _walk(v, f"{path}[{i}]", key)
 
     _walk(_effective, "root")
     print(f"     记忆库有效条目 {len(_effective)} 篇 / "
@@ -148,11 +155,23 @@ else:
           f"疑似取值的字段：{_bad[:5] or '（无）'}")
     check(not _bad, "记忆里没有任何浮点数或含小数的字符串（参数取值不可能出现）")
 
+    # 脏标题: 有些论文(如 ICLR 模板)的"标题"会被抽成页眉那句
+    # 「Published as a conference paper at ICLR 2018」——不同论文共用同一句,
+    # 按标题合并必然撞车。这类标题**本身**是待修的抽取缺陷(见待跟进), 但不该让
+    # 这条收敛性守门误报, 否则守门会被关掉, 真正要防的"同篇多指纹"就没人看了。
+    _JUNK_TITLE = re.compile(r"^(published as a conference paper|under review|preprint"
+                             r"|proceedings of|abstract$|(无标题)$)", re.IGNORECASE)
     _titles: dict = {}
+    _junk = 0
     for _k, _v in _effective.items():
-        _titles.setdefault((_v or {}).get("title") or "(无标题)", []).append(_k)
+        _t = (_v or {}).get("title") or "(无标题)"
+        if _JUNK_TITLE.search(_t.strip()) or len(_t.strip()) < 8:
+            _junk += 1
+            continue
+        _titles.setdefault(_t, []).append(_k)
     _dup = {t: k for t, k in _titles.items() if len(k) > 1}
-    print(f"     同一篇论文被拆成多条记录的：{len(_dup)} 篇")
+    print(f"     同一篇论文被拆成多条记录的：{len(_dup)} 篇"
+          f"（另有 {_junk} 篇标题是页眉/占位文字，不参与合并判断）")
     check(not _dup, "记忆索引按论文收敛（同标题不得多指纹）")
 
 print("⑤ 就绪度: 「未核验」必须显式, 且不得因'没提供材料'扣分")
@@ -164,10 +183,10 @@ _demo_pdf = HERE / "demo/paper.pdf"
 _demo_zip = HERE / "demo/project.zip"
 _demo_res = json.loads((HERE / "demo/results.json").read_text(encoding="utf-8"))
 _with, _ = run_audit(str(_demo_pdf), str(_demo_zip), _demo_res,
-                     force_mock=True, plan_mode=True)
+                     force_mock=True)
 _without, _ = run_audit(str(_demo_pdf), str(_demo_zip), None,
-                        force_mock=True, plan_mode=True)
-_c_no, _ = run_audit(str(_demo_pdf), "", None, force_mock=True, plan_mode=True)
+                        force_mock=True)
+_c_no, _ = run_audit(str(_demo_pdf), "", None, force_mock=True)
 c1 = (_with.readiness or {}).get("categories") or {}
 u1 = (_with.readiness or {}).get("unverified") or {}
 c2 = (_without.readiness or {}).get("categories") or {}

@@ -1,18 +1,18 @@
-"""真机验证: 经典模式 与 计划模式 在界面上是否**看得出差别**。
+"""真机验证：删掉「经典模式」之后，界面上**只有一条路**且这条路口径清楚。
 
-四种组合各跑一遍, 抓「执行记录」面板的实际文字:
-  A 经典 + 演示数据(材料齐备)      → 应显示"强制全跑（兜底模式）", 无跳过
-  B 计划 + 演示数据(材料齐备)      → 应显示"调度员排计划"/"AI 排计划", 并如实呈现执行集合
-  C 经典 + 只传论文(无代码)        → 代码扫描仍执行(经典模式不看材料)
-  D 计划 + 只传论文(无代码)        → 代码扫描被跳过, 且给出理由  ← 两模式的真正差别
+2026-10-25 用户口径：删除经典模式（不看材料、固定全序全跑），回到科学智能体主线。
+原脚本是"经典 vs 计划"四组对照，对照组没了，于是改成守**单一路径的两个场景**：
 
-⚠️ 断言口径（2026-09-29 调整）：**不写死跳过数**。
-网页端**恒开** AI 参与决策（不设开关），AI 会按成本判断额外跳过环节（实测 B 从 0 跳过变 1、D 从 3 变 4）
-—— 那正是 agent 在起作用，不是回归。所以这里守的是**契约**：
+  A 演示数据（材料齐备）  → 计划内全部执行、无「未执行」，决策表在
+  B 只传论文（无代码）    → 代码扫描 / 根因 / 补丁被跳过，且**逐条给出理由**
+
+⚠️ 断言口径：**不写死跳过数**。模型会按成本判断额外跳过（那正是 agent 在起作用）。
+这里守的是**契约**：
+  · 页面上不该再有任何"模式切换"开关
   · 执行 + 跳过 = 全部工具（执行集合如实呈现）
   · 每个跳过都有理由可查（决策表在）
-  · 流程面板的「未执行」次数不少于被跳过的工具数（面板跟着实际执行走）
-  · AI 要么说明"判定了几个不值得跑"，要么如实说"未生效"，不许含糊
+  · 流程面板的「未执行」次数不少于被跳过的工具数
+  · 谁排的计划要如实标注（模型排 / 规则版兜底 / 模型未生效）
 """
 from __future__ import annotations
 
@@ -30,8 +30,10 @@ sys.path.insert(0, str(ROOT))
 from paper2lab.toolbox import TOOLS       # noqa: E402  （断言"执行+跳过=全部工具"要用）
 PORT = 8513
 PAPER = ROOT / "demo" / "paper.pdf"
-OUT = ROOT / "_modes_ui.txt"
-SHOTS = ROOT / "_shot_classic.png", ROOT / "_shot_plan.png"
+_OUT_DIR = ROOT / ".trash_tmp"      # 验证产物落已 gitignore 的临时目录，不污染工作区
+_OUT_DIR.mkdir(exist_ok=True)
+OUT = _OUT_DIR / "_modes_ui.txt"
+SHOTS = _OUT_DIR / "_shot_full.png", _OUT_DIR / "_shot_paper_only.png"
 log: list[str] = []
 
 
@@ -65,19 +67,20 @@ try:
     with sync_playwright() as p:
         browser = p.chromium.launch(channel="msedge", headless=True)
 
-        def run_case(tag: str, planner: bool, upload_paper: bool) -> str:
+        def run_case(tag: str, upload_paper: bool) -> str:
             page = browser.new_page(viewport={"width": 1500, "height": 1200})
             errs: list[str] = []
             page.on("pageerror", lambda e: errs.append(str(e)))
-            page.goto(f"http://127.0.0.1:{PORT}", timeout=60000)
+            page.goto(f"http://127.0.0.1:{PORT}/?view=exec", timeout=60000)
             page.wait_for_timeout(9000)
 
-            # 现在**默认就是计划模式**（调度员排计划）；只有打开「兜底开关」才切到经典模式。
-            if not planner:
-                lab = page.locator("label").filter(has_text="兜底开关")
-                if lab.count():
-                    lab.first.click()
-                    page.wait_for_timeout(2500)
+            # ⚠ 「使用内置演示数据」默认是**开**的, 而上传优先级低于它 —— 只传论文那组
+            #   若不先关掉这个开关, 跑的根本是**演示材料**, 等不到「执行记录」还会读成 -1,
+            #   看起来像"应用卡住", 其实是测试自己没配好输入（2026-09-29 实测踩过）。
+            demo_lab = page.locator("label").filter(has_text="使用内置演示数据")
+            if upload_paper and demo_lab.count():
+                demo_lab.first.click(force=True)
+                page.wait_for_timeout(2000)
             if upload_paper:
                 inputs = page.locator("input[type=file]")
                 inputs.nth(0).set_input_files(str(PAPER))
@@ -88,12 +91,16 @@ try:
             for _ in range(45):
                 page.wait_for_timeout(2000)
                 body = page.inner_text("body")
-                if "执行记录" in body:
+                # ⚠ 2026-10-26：不能用「执行记录」当锚点 —— 改了分页之后，**侧栏导航里**
+                #    就有这四个字，一进页面就为真，循环立刻跳出，读到的是还没跑完的页面
+                #    （表现为"执行集合"读成 -1）。改等展开栏标题「执行 N 个工具 / 跳过 M 个」
+                #    里的「个工具」，它只在结果出来后才出现。
+                if "个工具" in body:
                     break
             page.wait_for_timeout(3000)
             body = page.inner_text("body")
 
-            shot = SHOTS[1] if planner else SHOTS[0]
+            shot = SHOTS[1] if upload_paper else SHOTS[0]
             page.screenshot(path=str(shot))
             if errs:
                 say(f"  ⚠ {tag} 控制台异常 {len(errs)}: {errs[:2]}")
@@ -101,38 +108,26 @@ try:
             return body
 
         say("")
-        say("=== A. 经典模式 + 演示数据（材料齐备）===")
-        a = run_case("A", planner=False, upload_paper=False)
+        say("=== A. 演示数据（材料齐备）===")
+        a = run_case("A", upload_paper=False)
         results["A"] = a
-        for k in ["经典模式", "强制全跑", "不看材料齐不齐", "调度员的决策", "计划跳过"]:
+        for k in ["执行记录", "模型的决策", "规则兜底的决策", "模型排计划",
+                  "兜底开关", "经典模式"]:
             say(f"  含「{k}」: {k in a}")
 
         say("")
-        say("=== B. 计划模式 + 演示数据（材料齐备）===")
-        b = run_case("B", planner=True, upload_paper=False)
+        say("=== B. 只传论文（无代码）===")
+        b = run_case("B", upload_paper=True)
         results["B"] = b
-        for k in ["计划模式", "调度员排计划", "调度员的决策", "执行集合与经典模式相同"]:
+        for k in ["模型排计划", "规则版计划", "模型的决策", "计划跳过",
+                  "未提供代码包", "未执行", "执行记录"]:
             say(f"  含「{k}」: {k in b}")
-
-        say("")
-        say("=== C. 经典模式 + 只传论文（无代码）===")
-        c = run_case("C", planner=False, upload_paper=True)
-        results["C"] = c
-        for k in ["经典模式", "强制全跑", "计划跳过", "未执行"]:
-            say(f"  含「{k}」: {k in c}")
-
-        say("")
-        say("=== D. 计划模式 + 只传论文（无代码）===")
-        d = run_case("D", planner=True, upload_paper=True)
-        results["D"] = d
-        for k in ["计划模式", "调度员排计划", "调度员的决策", "计划跳过", "未提供代码包", "未执行"]:
-            say(f"  含「{k}」: {k in d}")
 
         browser.close()
 
     # ---------------- 断言 ----------------
     # 注: 执行明细表用 st.dataframe, 是 canvas 渲染的, inner_text 读不到单元格文本;
-    #     因此改从**展开栏标题**（DOM 可见）读"执行 N 个 / 跳过 M 个"来判定。
+    #     因此从**展开栏标题**（DOM 可见）读"执行 N 个 / 跳过 M 个"来判定。
     def counts(body: str) -> tuple:
         m = re.search(r"执行\s*(\d+)\s*个工具\s*/\s*跳过\s*(\d+)\s*个", body)
         return (int(m.group(1)), int(m.group(2))) if m else (-1, -1)
@@ -140,46 +135,52 @@ try:
     say("")
     say("=== 从展开栏标题读到的执行计数 ===")
     cs = {k: counts(v) for k, v in results.items()}
-    for k in "ABCD":
+    for k in "AB":
         say(f"  {k}: 执行 {cs[k][0]} 个 / 跳过 {cs[k][1]} 个")
 
     say("")
+    # 决策表标题有两种（界面如实区分谁排的计划，两种都必须认）：
+    #   模型可用 → 「模型的决策」；模型不可用 → 「规则兜底的决策」。
+    def _has_decision_table(t: str) -> bool:
+        return "模型的决策" in t or "规则兜底的决策" in t
+
+    # 不占进度格的工具数（**派生，不写死**）：它们被跳过时，流程面板上没有对应的
+    # 「未执行」格子 —— 面板是按环节画的，这类工具只在决策表里交代。
+    _NO_STEP = sum(1 for t in TOOLS if not t.checkpoints)
+
     say("=== 断言 ===")
     checks = [
-        ("A 是经典模式", "经典模式" in results["A"]),
-        ("A 标明是兜底强制全跑", "强制全跑" in results["A"]),
-        ("A 没有「调度员的决策」", "调度员的决策" not in results["A"]),
-        ("A 无跳过", cs["A"][1] == 0),
-        # ---- 计划模式有两条标签都算数：规则版「计划模式」/ AI 版「AI 排计划」。
-        # 2026-09-29 起网页端恒开 AI 参与（无开关），标签会变成后者 —— 断言不能只认前者。
-        ("B 是计划模式且有调度决策",
-         ("计划模式" in results["B"] or "AI 排计划" in results["B"])
-         and "调度员的决策" in results["B"]),
-        # ---- 跳过数**不再写死**：AI 会按成本判断额外跳过（这正是 agent 在起作用，
-        # 实测 B 从 0 跳过变成 1 跳过、D 从 3 变成 4）。要守住的是"契约"而不是某个数字。
+        # ---- 2026-10-25 删掉经典模式：页面上不该再有任何模式切换口子
+        ("页面上已无「兜底开关」（经典模式入口已删除）",
+         "兜底开关" not in results["A"] and "兜底开关" not in results["B"]),
+        ("页面上已无「经典模式」字样", "经典模式" not in results["A"]),
+        ("A 有决策表（谁排的计划必须摊开）", _has_decision_table(results["A"])),
+        ("A 执行集合如实呈现（执行 + 跳过 = 全部工具）",
+         cs["A"][0] + cs["A"][1] == len(TOOLS)),
+        # 2026-09-28: 「根因追查 / 补丁草案」登记成工具后，无代码时**至少**这三个被跳过
+        # （代码扫描 + 根因追查 + 补丁草案 —— 后两者都要读代码）。
+        ("B（无代码）至少跳过 3 个（代码扫描 / 根因 / 补丁）", cs["B"][1] >= 3),
         ("B 执行集合如实呈现（执行 + 跳过 = 全部工具）",
          cs["B"][0] + cs["B"][1] == len(TOOLS)),
-        ("B 的跳过都有理由可查（决策表在）", "调度员的决策" in results["B"]),
-        ("C（经典·无代码）代码扫描仍执行、无跳过", cs["C"][1] == 0),
-        # 2026-09-28: 「根因追查 / 补丁草案」登记成工具后, 无代码时**至少**这三个被跳过
-        # （代码扫描 + 根因追查 + 补丁草案 —— 后两者都要读代码）。
-        # 2026-09-29: 由「== 3」放宽为「>= 3」—— AI 参与排计划时还可能额外跳过别的环节。
-        ("D（计划·无代码）至少跳过 3 个（代码扫描 / 根因 / 补丁）", cs["D"][1] >= 3),
-        ("D 执行集合如实呈现（执行 + 跳过 = 全部工具）",
-         cs["D"][0] + cs["D"][1] == len(TOOLS)),
-        ("D 给出了跳过理由", "未提供代码包" in results["D"]),
-        ("同输入下 C 与 D 的执行集合确实不同", cs["C"][1] != cs["D"][1]),
-        # ---- 流程面板（十二环节进度条）必须跟着**实际执行**走
-        ("经典模式（A / C）不出现「未执行」",
-         "未执行" not in results["A"] and "未执行" not in results["C"]),
-        ("D 流程面板标出了「未执行」", "未执行" in results["D"]),
-        # 每个被跳过的工具至少标出一处「未执行」（不写死次数：跳过数随 AI 判断波动）
-        ("B / D 的「未执行」次数不少于被跳过的工具数",
-         results["B"].count("未执行") >= cs["B"][1]
-         and results["D"].count("未执行") >= cs["D"][1]),
-        # ---- agent 的决策必须留痕：生效要写"AI 判定 N 个不值得跑"，不可用要如实说"未生效"
-        ("AI 决策留痕（生效说明 或 未生效说明，二者必居其一）",
-         "AI 排计划" in results["B"] or "AI 排计划未生效" in results["B"]),
+        ("B 给出了跳过理由（点明缺代码包）", "未提供代码包" in results["B"]),
+        ("B 的跳过都有理由可查（决策表在）", _has_decision_table(results["B"])),
+        ("B 流程面板标出了「未执行」", "未执行" in results["B"]),
+        # 流程面板按**进度格**走；不占格的工具（如「化学身份核验」）被跳过时，
+        # 面板上不会有它的「未执行」—— 这是设计如此，不是漏标。
+        # 所以口径是：**有进度格的**跳过项必须都能在面板上看见。
+        ("A / B 的「未执行」覆盖有进度格的跳过项",
+         results["A"].count("未执行") >= cs["A"][1] - _NO_STEP
+         and results["B"].count("未执行") >= cs["B"][1] - _NO_STEP),
+        # 不占格的工具被跳过，也得在决策表里给出理由 —— 面板没有它的格子，
+        # 决策表就是它唯一的交代处，不能两头都没有。
+        ("A / B 的跳过都有理由可查（含不占格的工具）",
+         _has_decision_table(results["A"]) and _has_decision_table(results["B"])),
+        # ---- 谁排的计划必须留痕：模型生效 / 规则版兜底 / 如实说未生效，三者必居其一
+        ("排计划有留痕（模型排 或 规则版兜底 或 未生效说明）",
+         "模型排计划" in results["A"] or "规则版计划" in results["A"]
+         or "模型排计划未生效" in results["A"]),
+        ("A 与 B 的执行集合确实不同（计划真按材料走，不是固定全跑）",
+         cs["A"][1] != cs["B"][1]),
     ]
     bad = 0
     for label, okk in checks:
@@ -192,13 +193,10 @@ try:
         "「这次实际做出了什么」列）由 verify_execview.py 以数据层断言覆盖。")
     say(f"截图: {SHOTS[0].name} / {SHOTS[1].name}")
     say("")
-    say(f"未通过 {bad} 项" if bad else "全部通过（说明两模式在界面上确实可区分）")
+    say(f"未通过 {bad} 项" if bad else "全部通过（单一路径在界面上口径清楚）")
+    # ⚠ 必须真判红：脚本只打印计数就 return 的话，退出码恒为 0 → 体检里永远 OK，
+    #   界面口径漂移完全拦不住（2026-10-15 实测漏掉两处文案被改）。
+    raise SystemExit(1 if bad else 0)
 finally:
     proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except Exception:
-        proc.kill()
-
-OUT.write_text("\n".join(log), encoding="utf-8")
-print("done")
+    (OUT).write_text("\n".join(log), encoding="utf-8")

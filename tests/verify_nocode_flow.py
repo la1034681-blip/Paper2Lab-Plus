@@ -57,7 +57,7 @@ for name, pdf, res, real in CASES:
 
     row = {"name": name}
     try:
-        a, report = run_audit(str(pdf), "", ur, force_mock=not real, plan_mode=True)
+        a, report = run_audit(str(pdf), "", ur, force_mock=not real)
     except Exception as e:  # noqa: BLE001
         problems.append(f"{name}: run_audit 抛异常 {type(e).__name__}: {e}")
         out.append(f"| {name} | ✗ | — | — | — | — | — | — | **审计就崩了** |")
@@ -135,10 +135,21 @@ _memfile = HERE / "cache/audit_memory.json"
 _eff = _memory.entries()
 if _eff:
     _titles: dict = {}
+    # 页眉/占位类"标题"不参与合并判断：ICLR 模板的首页第一行是
+    # 「Published as a conference paper at ICLR 2018」，不同论文会撞成同一句。
+    # （抽取端已改成跳过这类行，见 paper_parser._BANNER_LINE；这里是兜住缓存里的旧条目）
+    _JUNK = ("published as a conference paper", "under review", "preprint",
+             "proceedings of", "abstract", "(无标题)")
+    _junk_n = 0
     for _k, _v in _eff.items():
-        _titles.setdefault((_v or {}).get("title") or "(无标题)", []).append(_k)
+        _t = (_v or {}).get("title") or "(无标题)"
+        if _t.strip().lower().startswith(_JUNK) or len(_t.strip()) < 8:
+            _junk_n += 1
+            continue
+        _titles.setdefault(_t, []).append(_k)
     _dup = {t: k for t, k in _titles.items() if len(k) > 1}
-    out.append(f"- 记忆库有效明细 {len(_titles)} 篇；标题重复的：{len(_dup)} 篇")
+    out.append(f"- 记忆库有效明细 {len(_titles)} 篇；标题重复的：{len(_dup)} 篇"
+               + (f"（另有 {_junk_n} 篇标题是页眉/占位文字，不参与合并判断）" if _junk_n else ""))
     if _dup:
         problems.append(f"记忆库存在同标题多指纹: {list(_dup)[:3]}")
         out.append(f"  - **✗** {_dup}")
@@ -157,7 +168,10 @@ else:
                "四个下游模块均正常产出、未凭空给出补丁；记忆索引也已按论文收敛。")
 out.append("")
 
-(HERE / "_nocode.txt").write_text("\n".join(out), encoding="utf-8")
+# 产物写进 .trash_tmp/（工作区卫生：根目录只留工程本体，临时草稿一律下沉）
+_DRAFT = HERE / ".trash_tmp"
+_DRAFT.mkdir(exist_ok=True)
+(_DRAFT / "_nocode.txt").write_text("\n".join(out), encoding="utf-8")
 print("\n".join(out))
 if problems:
     raise SystemExit(1)

@@ -72,6 +72,9 @@ class AuditBenchDataset:
                     "found_paper": ans.get("found_params", {}).get("paper", []),
                     "found_code": ans.get("found_params", {}).get("code", []),
                     "n_findings": score["n_findings"],
+                    # 3C：档位与规模随明细一起留底 —— 报告要能说清"这一档多做了什么"
+                    "tier": ans.get("tier", ""),
+                    "stats": dict(ans.get("stats", {}) or {}),
                     "score": dict(score)})
         self.details[idx] = det
         return score

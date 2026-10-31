@@ -4,15 +4,21 @@
 1. 检索是**字面检索**（同义词扩展 + 取值命中），不对外说成语义/RAG；
 2. 检索不到就说检索不到，**不拿不相关段落充数**；
 3. 出处核验与 `selfcheck` 的「证据自证」是**两个维度**，本模块不重复它的工作；
-4. 外部文献检索**默认关闭**；即便开启，返回线索一律带 `unverified=True`。
+4. 外部检索两条路：`external_search()`（模型钩子，默认关）与 `literature_search()`
+   （真实多源查询，4A）。本项只看它们**都不把外部线索当结论**，
+   所以显式关掉真实检索、避免本项结果受外网影响 —— 真实检索由
+   `verify_literature.py` 专测（含离线桩与真网加测）。
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+
+os.environ["PAPER2LAB_LIT"] = "off"
 
 from paper2lab.models import (Category, Confidence, Evidence, Finding, PaperInfo,
                               Risk, Status)
@@ -160,7 +166,7 @@ check(rep0.coverage["total"] == 0 and rep0.items == [], "没有结论 -> 空结�
 
 # ═══════════════════════════════════════ 3. 外部检索（默认关闭）
 
-sec("3. external_search —— 默认关闭，开启也要标未核验")
+sec("3. external_search —— 模型钩子默认关闭，开启也要标未核验")
 
 off = external_search("任意意图")
 check(off["enabled"] is False, "默认关闭")

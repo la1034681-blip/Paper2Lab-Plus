@@ -33,7 +33,7 @@ def check(ok: bool, label: str) -> None:
 # ---------- 材料齐备（计划模式）----------
 print("① 材料齐备：每件工具都应算得出实际产出")
 audit, _ = run_audit(str(HERE / "demo/paper.pdf"), str(HERE / "demo/project.zip"),
-                     None, force_mock=True, plan_mode=True)
+                     None, force_mock=True)
 ex = audit.execution_log or {}
 
 # 环节映射
@@ -69,7 +69,7 @@ check(len(steps) == len(TOOLS), f"执行记录覆盖全部工具（{len(steps)}/
 print("")
 print("② 只给论文（无代码）：跳过的那一行应给出理由而不是产出")
 audit2, _ = run_audit(str(HERE / "demo/paper.pdf"), "", None,
-                      force_mock=True, plan_mode=True)
+                      force_mock=True)
 ex2 = audit2.execution_log or {}
 skipped = [s for s in ex2.get("steps", []) if s["status"] == "skipped"]
 print(f"   跳过 {len(skipped)} 个工具：")
@@ -78,15 +78,16 @@ for s in skipped:
 check(bool(skipped), "无代码时确有工具被计划跳过")
 check(any("代码" in s["reason"] for s in skipped), "跳过理由点明了是缺代码包")
 
-# 同一输入下经典模式不跳过
+# 2026-10-25 删掉「经典模式」后的口径：同一份材料、同一套输入，两次跑出来的
+# 执行记录必须**结构一致、状态一致**（计划是确定性的，规则版不许随机）。
 audit3, _ = run_audit(str(HERE / "demo/paper.pdf"), "", None,
-                      force_mock=True, plan_mode=False)
+                      force_mock=True)
 ex3 = audit3.execution_log or {}
 n3 = sum(1 for s in ex3.get("steps", []) if s["status"] == "skipped")
-print(f"   同一输入·经典模式：跳过 {n3} 个")
-check(n3 == 0, "经典模式不看材料、固定全跑（跳过 0）")
+print(f"   同一输入重跑：跳过 {n3} 个")
+check(n3 == len(skipped), "重跑的计划与上一次一致（确定性，不随机跳）")
 check(len(ex2.get("steps", [])) == len(ex3.get("steps", [])),
-      "两模式的执行记录都覆盖全部工具（差别只在状态）")
+      "两次执行记录都覆盖全部工具（差别只在状态）")
 
 print("")
 print("③ 「抽取 Agent」面板标题必须随材料变（不能是静态文案）")
@@ -102,7 +103,7 @@ for name, pdf, zipf in [
     if not pdf.exists() or not zipf.exists():
         print(f"   - {name}: 材料缺失，跳过")
         continue
-    _a, _ = run_audit(str(pdf), str(zipf), None, force_mock=True, plan_mode=True)
+    _a, _ = run_audit(str(pdf), str(zipf), None, force_mock=True)
     t = agent_panel_title(_a.coverage or {})
     _titles[name] = t
     print(f"   - {name}: {t}")

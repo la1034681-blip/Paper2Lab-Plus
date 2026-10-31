@@ -44,6 +44,37 @@ DIGEST_MAX_PAGES = 12      # 摘要里每个参数最多记多少个"常见页"
 # 版本 1: 指纹 = sha1(论文 + 代码)   版本 2: 指纹 = sha1(论文)
 _SCHEME = 2
 
+#: 「像章节号」的标题 —— 形如 `4.1 Experimental setup` / `3.2.1 Ablation study`。
+#: 论文标题抽不出来时, 解析器会退而把**正文章节标题**当论文标题。这类字符串不是
+#: 论文名, 一旦写进记忆会引发两个真问题:
+#:   ① 不同论文撞成同一个"标题", 让「同标题多指纹」守卫误报(实测: 两条记录同叫
+#:      「4.1 Experimental setup」, 其中一条是测试样本, 却让整套体检变红);
+#:   ② 「已审计 N 次」被记到一条谁也认不出的记录上, 记忆的连续性失去意义。
+#: 抽取失败本身是允许的状态(如实留空), 但**不该固化进记忆**。
+#: 首段数字限 1–2 位: 章节号("6." / "4.1")都短, 而 "2017 IEEE Conference …" 这类
+#: **以年份开头的真标题**首段是 4 位 —— 不设上限就会把真标题也挡掉(实测反例)。
+_CHAPTER_LIKE = re.compile(r"^\s*\d{1,2}(?:\.\d{1,2})*\.?\s+\S")
+
+#: 页眉 / 版权 / 模板行 —— **不是**标题（2026-10-29 补）。
+# 实证: ICLR 模板首页第一行「Published as a conference paper at ICLR 2018」被当成标题
+# 写进记忆，于是好几篇不同论文的"标题"完全一样，记忆索引像"同一篇存了多条"；
+# 另有 arXiv 编号行、「Provided proper attribution ...」占位行。
+_BANNER_LIKE = re.compile(
+    r"^(published\s+as|under\s+review\s+as|provided\s+proper\s+attribution|"
+    r"proceedings\s+of|to\s+appear\s+in|accepted\s+(?:at|by)|arxiv:|doi:|"
+    r"https?://|©|copyright|all\s+rights\s+reserved)",
+    re.IGNORECASE)
+
+
+def _usable_title(title: str) -> bool:
+    """这个标题够不够格写进记忆: 空串、章节号、页眉/版权行都算不合格。"""
+    t = (title or "").strip()
+    if not t:
+        return False
+    if _BANNER_LIKE.match(t):
+        return False
+    return not _CHAPTER_LIKE.match(t)
+
 
 def _load() -> dict:
     try:
@@ -54,6 +85,26 @@ def _load() -> dict:
         return {}
     if int(data.get("_scheme") or 0) != _SCHEME:
         return {}          # 旧口径的键已不可达 -> 视为空库
+    # 旧条目里已经混进页眉/版权标题（修 _usable_title 之前写进去的）。
+    # 线索照留，只把名字改成「未命名论文 + 指纹前 8 位」——绝不删数据，也绝不让
+    # 几篇不同的论文继续共用同一个页眉标题。
+    for fp, ent in list(data.items()):
+        if str(fp).startswith("_") or not isinstance(ent, dict):
+            continue
+        if not _usable_title(str(ent.get("title") or "")):
+            ent["title"] = f"未命名论文 {str(fp)[:8]}"
+    # 同标题不同指纹: 两篇**不同**文档取了同一个名字（竞赛题同题多版本），
+    # 光看名字分不清谁是谁。给重名的每条加指纹前 4 位 —— 只改显示名，
+    # 不删任何线索，索引里也能一眼区分（2026-10-29 补）。
+    _same: dict = {}
+    for fp, ent in data.items():
+        if str(fp).startswith("_") or not isinstance(ent, dict):
+            continue
+        _same.setdefault(str(ent.get("title") or ""), []).append(str(fp))
+    for _t, _fps in _same.items():
+        if len(_fps) > 1:
+            for _f in _fps:
+                data[_f]["title"] = f"{_t}（{_f[:4]}）"
     return data
 
 
@@ -196,8 +247,14 @@ def remember(audit, fp: str) -> dict:
 
     data = _load()
     old = data.get(fp) or {}
+    # 标题抽取失败(空 / 章节号)时**不照抄**, 也不跟别的论文共用同一个名字:
+    # 退成「未命名论文 + 指纹前 8 位」—— 线索照留, 但绝不会撞名。
+    _title = paper.title if _usable_title(paper.title) else ""
+    _title = _title or (old.get("title") if _usable_title(old.get("title")) else "")
+    if not _title:
+        _title = f"未命名论文 {fp[:8]}"
     entry = {
-        "title": paper.title or old.get("title", ""),
+        "title": _title,
         "runs": int(old.get("runs") or 0) + 1,
         "last_seen": f"{datetime.now():%Y-%m-%d %H:%M}",
         "unresolved": sorted(seen - got),         # 线索: 已确认"论文没给确定值"

@@ -1,4 +1,4 @@
-"""真实读图验证——用 MiMo 视觉模型跑图像通道(扫描件样例 + 真实论文)。
+"""真实读图验证——用真实视觉模型跑图像通道(扫描件样例 + 真实论文)。
 
 对照点:
 - 扫描件样例(文本层为空): 期望读到 lr=3e-5 / batch=64 / epochs=50 / dropout=0.3,
@@ -28,7 +28,11 @@ CASES = [
      r"C:\Users\lijiahui\Desktop\E题作答.zip"),
 ]
 
-log: list[str] = ["# 图像通道真实读图验证(MiMo mimo-v2.5)", ""]
+from paper2lab import vision as _vision
+_pv = _vision._provider() or ("", "", "", "")
+# 标题按**实际生效的模型名**写（2026-10-24：不再写死 MiMo —— 换模型后标题跟着变，
+# 免得报告标题与实际调用对不上，看报告的人会误判"还在用旧模型"）
+log: list[str] = [f"# 图像通道真实读图验证({_pv[2] or '未配置'})", ""]
 
 for name, pdf, zipf in CASES:
     t0 = time.time()

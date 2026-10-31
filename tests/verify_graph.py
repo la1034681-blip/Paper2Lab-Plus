@@ -47,7 +47,7 @@ def main():
         c(graph is not None, "图编译成功")
         # LangGraph 1.x 的 compiled graph 不暴露节点数，改从源码数
         n_tools = len(TOOLS)
-        c(n_tools == 10, f"工具数 {n_tools}（与经典版一致）")
+        c(n_tools >= 10, f"工具数 {n_tools}（≥10，不许被悄悄砍掉；阶段二 2A 起为 11）")
         # 口径: 每个**工具**都必须有闸门前置条件（可以为空集，表示无需前置）。
         # 反过来不一定 —— 阶段四的对撞区节点（roles/collider/...）也在 _PRECONDITIONS
         # 里登记了，但它们不是工具，不进 TOOLS。
@@ -62,7 +62,8 @@ def main():
     try:
         keys = [t.key for t in TOOLS]
         expected = ["start", "assemble_context", "plan"] + keys + ["finalize"]
-        c(len(expected) == 14, f"节点链长度 {len(expected)}（10 工具 + 4 控制）")
+        c(len(expected) == len(TOOLS) + 4,
+          f"节点链长度 {len(expected)}（工具数 + 4 个控制节点，随 TOOLS 走）")
         c(keys[0] == "parse_paper", f"第一个工具是 parse_paper")
         c(keys[-1] == "report", f"最后一个工具是 report")
     except Exception as ex:
@@ -84,6 +85,9 @@ def main():
     state = {
         "paper": object(), "code": object(),
         "audit": type("A", (), {"findings": [1], "rootcause": [1]})(),
+        # 阶段二 2A/2D：① 站的假设卡 —— ② 站（design_experiment）的前置就是它。
+        # 不补这一项，实验节点会被判 blocked（这正是闸门该有的行为：没有假设卡就没有可设计的实验）。
+        "hypotheses": [{"key": "learning_rate"}],
         # 对撞区的前置产物（阶段四）——不补这几项，roles/collider/... 会被判 blocked
         "paper_view": {"learning_rate": {"value": "1e-4"}},
         "code_view": {"learning_rate": {"value": "1e-3"}},
@@ -133,10 +137,19 @@ def main():
                    for c, g in zip(c_audit.findings, g_audit.findings))
         c(same, "逐条参数与状态一致（结论不变）")
         # 骨架版的执行记录
+        # ⚠ 2026-10-29 修: 原来断言"全部工具 done"。但计划本来就会按材料跳过
+        #   （本用例没配读图通道/正文无化学标记 → 2 件跳过）—— 旧断言能过，是因为
+        #   图版当时**根本不看计划决策**。现在图版与经典版同口径，断言也改成
+        #   "跳过的件数与经典版一致"，否则等于把 bug 固化成契约。
         g_log = getattr(g_audit, "execution_log", {})
-        c(g_log.get("nodes_done", 0) == 12, f"骨架版 12 个节点全部 done: {g_log.get('nodes_done')}")
+        c_log = getattr(c_audit, "execution_log", {})
+        _c_skip = int(c_log.get("skipped") or 0)
+        c(g_log.get("nodes_done", 0) == len(TOOLS) + 2 - _c_skip,
+          f"骨架版执行过的节点全 done（{len(TOOLS) - _c_skip} 件工具 + 2 个控制节点）: "
+          f"{g_log.get('nodes_done')}")
         c(g_log.get("nodes_failed", 0) == 0, f"骨架版 0 个节点失败: {g_log.get('nodes_failed')}")
-        c(g_log.get("nodes_skipped", 0) == 0, f"骨架版 0 个节点跳过: {g_log.get('nodes_skipped')}")
+        c(int(g_log.get("skipped") or 0) == _c_skip,
+          f"骨架版跳过的工具数与经典版一致（同为 {_c_skip} 件）: {g_log.get('skipped')}")
     except Exception as ex:
         c(False, f"骨架版运行失败: {type(ex).__name__}: {ex}")
         import traceback

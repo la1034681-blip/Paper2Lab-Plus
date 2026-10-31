@@ -14,7 +14,10 @@ import os
 import time
 from pathlib import Path
 
-MOCK = Path("_mock_vision.json")
+# 夹具也放 .trash_tmp/：脚本跑完不该在工程根目录留下草稿（工作区卫生）
+_SCRATCH = _pl.Path(__file__).resolve().parent.parent / ".trash_tmp"
+_SCRATCH.mkdir(exist_ok=True)
+MOCK = _SCRATCH / "_mock_vision.json"
 MOCK.write_text(json.dumps({
     "params": [
         {"name": "dropout", "value": "0.1", "evidence_text": "dropout = 0.1"},
@@ -112,5 +115,8 @@ finally:
     except OSError:
         pass
 
-Path("_vshard.txt").write_text("\n".join(out), encoding="utf-8")
+# 产物写到 .trash_tmp/，不在工程根目录留草稿（工作区卫生）
+_OUT = _pl.Path(__file__).resolve().parent.parent / ".trash_tmp"
+_OUT.mkdir(exist_ok=True)
+(_OUT / "_vshard.txt").write_text("\n".join(out), encoding="utf-8")
 print("done")

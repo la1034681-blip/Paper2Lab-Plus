@@ -56,7 +56,7 @@ for name in ("02_DETR", "05_ViT", "01_DDPM"):
     rf = d / "results.json"
     ur = json.loads(rf.read_text(encoding="utf-8")) if rf.exists() else None
 
-    audit, _ = run_audit(str(d / "paper.pdf"), str(zf), ur, plan_mode=True)
+    audit, _ = run_audit(str(d / "paper.pdf"), str(zf), ur)
     traces = trace_findings(audit)
     patches = propose_patches(audit, traces, str(zf))
 
@@ -121,7 +121,10 @@ out.append("=" * 70)
 out.append("  全部封住 ✅" if not gaps else "  ❌ " + "\n  ❌ ".join(gaps))
 out.append("")
 
-Path("_patch.txt").write_text("\n".join(out), encoding="utf-8")
+# 产物写到 .trash_tmp/，不在工程根目录留草稿（工作区卫生）
+_OUT = _pl.Path(__file__).resolve().parent.parent / ".trash_tmp"
+_OUT.mkdir(exist_ok=True)
+(_OUT / "_patch.txt").write_text("\n".join(out), encoding="utf-8")
 print("done")
 if gaps:
     print("缺口回归未通过：")

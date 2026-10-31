@@ -198,8 +198,8 @@ def build_manual_check(audit: AuditResult) -> list[dict]:
             out.append({"level": "中", "kind": "文本稀薄页(未完全覆盖)",
                         "item": f"第 {', '.join(map(str, cov['thin_page_list']))} 页",
                         "why": _why,
-                        "action": ("在页面「高级设置」把「读图区域上限」调大(或设环境变量 "
-                                   "PAPER2LAB_VISION_MAX_REGIONS)后重跑, 即可读图这些页面; "
+                        "action": ("把环境变量 PAPER2LAB_VISION_MAX_REGIONS 设为 0(全部读取)"
+                                   "后重跑, 即可读图这些页面(页面上不再有这个输入框); "
                                    "读图结果按图缓存, 已读过的不会重复计费")
                         if (cov.get("image") or {}).get("enabled")
                         else "配置视觉模型 key 后重跑, 这些页面即可自动读图"})
@@ -307,7 +307,10 @@ def build_param_matrix(audit: AuditResult) -> list[dict]:
 def compute_coverage(audit: AuditResult) -> dict:
     """解析覆盖率汇总(把"抽没抽到"变成可量化指标)。"""
     pages = audit.paper.page_coverage or []
-    total_pages = len(pages) or audit.paper.page_count or 0
+    # 「读不出来」的占位条目不参与页数统计：它只是记一句原因，不是一页正文。
+    # 否则会出现"论文页数 0、覆盖率 0/1"这种自相矛盾的口径（也把可信度抬到了"中"）。
+    _readable = [p for p in pages if p.get("status") != "unreadable"]
+    total_pages = len(_readable) or audit.paper.page_count or 0
     thin_pages = [p for p in pages if p.get("status") == "thin"]
     ok_pages = [p for p in pages if p.get("status") == "ok"]
 
@@ -386,7 +389,17 @@ def compute_coverage(audit: AuditResult) -> dict:
     # 审计可信度(高/中/低): 由覆盖率与解析失败共同决定, 规则透明不调参
     score = 100
     notes: list[str] = []
-    if total_pages:
+    # ⚠ 先给默认值: 下面 `if total_pages:` 里才赋值, 但后面 coverage 字典无条件引用它。
+    # 论文一页都没解析出来(total_pages == 0, 例: PDF 打不开/整份是坏文件)时,
+    # 原写法会抛 UnboundLocalError, 把「读不出论文」这种可解释的失败变成程序崩溃。
+    pages_covered = 0
+    if not total_pages:
+        # 一页都没读出来（文件损坏 / 不是 PDF / 加密）：本次审计**没有论文侧依据**。
+        # 这时不能靠"没扣分"留在中高档 —— 那会让报告一边写"覆盖 0%"、一边给"中"。
+        score = 10
+        notes.append("论文一页都没读出来（文件可能损坏或不是 PDF）—— "
+                     "本次结论没有论文侧依据，请换文件重跑")
+    elif total_pages:
         # 页面覆盖要按**所有通道**算: 文本层可解析的 + 由视觉读图覆盖的薄页。
         # (只算文本层会把已读图的扫描/图片页当成"没覆盖", 从而误扣可信度——早期版本的缺陷)
         pages_covered = len(ok_pages) + len(thin_read)

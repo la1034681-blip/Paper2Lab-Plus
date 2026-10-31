@@ -36,7 +36,7 @@ print("同一个配置（经典模式）连跑 3 次 —— 看它自己稳不�
 print("=" * 66)
 runs = []
 for i in range(3):
-    a, _ = run_audit(str(pdf), str(code), None, plan_mode=False)
+    a, _ = run_audit(str(pdf), str(code), None)
     runs.append((a.readiness.get("total"), len(a.findings), sig(a)))
     print(f"  第 {i + 1} 次：就绪度 {a.readiness.get('total')}"
           f" · 结论 {len(a.findings)} 条")

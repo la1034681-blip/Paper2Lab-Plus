@@ -28,7 +28,7 @@ out.append("=" * 66)
 out.append("【第二批 · 澄清反问】demo 受控样例（计划模式）")
 out.append("=" * 66)
 
-a, _ = run_audit(PDF, ZIP, RES, vision_max_regions=2, plan_mode=True)
+a, _ = run_audit(PDF, ZIP, RES, vision_max_regions=2)
 qs = build_questions(a)
 s = summarize(qs)
 out.append(f"生成待确认问题 {s['total']} 条，构成：{s['by_kind']}")
@@ -91,7 +91,7 @@ for _name in ("02_DETR", "03_NeRF"):
     if not (_d / "paper.pdf").exists():
         continue
     a2, _ = run_audit(str(_d / "paper.pdf"), str(_d / "code.zip"), None,
-                      vision_max_regions=2, plan_mode=True)
+                      vision_max_regions=2)
     qs2 = build_questions(a2)
     out.append(f"{_name}：{len(qs2)} 条，构成 {summarize(qs2)['by_kind']}")
     for q in qs2[:6]:
@@ -105,5 +105,8 @@ out.append(f"  条目数（累计审过的论文）：{memory.size()}")
 for ln in memory.cross_task_stats():
     out.append(f"  · {ln}")
 
-Path("_p23.txt").write_text("\n".join(out), encoding="utf-8")
+# 产物写到 .trash_tmp/，不在工程根目录留草稿（工作区卫生）
+_OUT = _pl.Path(__file__).resolve().parent.parent / ".trash_tmp"
+_OUT.mkdir(exist_ok=True)
+(_OUT / "_p23.txt").write_text("\n".join(out), encoding="utf-8")
 print("done")

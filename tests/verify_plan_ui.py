@@ -12,7 +12,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PORT = 8511
-OUT = ROOT / "_plan_ui.txt"
+_OUT_DIR = ROOT / ".trash_tmp"      # 验证产物落已 gitignore 的临时目录，不污染工作区
+_OUT_DIR.mkdir(exist_ok=True)
+OUT = _OUT_DIR / "_plan_ui.txt"
 log: list[str] = []
 
 
@@ -49,7 +51,7 @@ try:
         page = browser.new_page(viewport={"width": 1500, "height": 1100})
         errors: list[str] = []
         page.on("pageerror", lambda e: errors.append(str(e)))
-        page.goto(f"http://127.0.0.1:{PORT}", timeout=60000)
+        page.goto(f"http://127.0.0.1:{PORT}/?view=总览", timeout=60000)
         page.wait_for_timeout(9000)
         say(f"页面文本长度: {len(page.inner_text('body'))}")
         say(f"含「兜底开关」: {'兜底开关' in page.inner_text('body')}")
@@ -67,13 +69,13 @@ try:
         body = page.inner_text("body")
         say("")
         say("=== 页面关键内容检查 ===")
-        for key in ["执行记录", "计划模式", "审计流水线", "调度员的决策"]:
+        for key in ["执行记录", "计划模式", "审计流水线", "模型的决策"]:
             say(f"  含「{key}」: {key in body}")
 
         m = re.search(r"执行记录[^\n]{0,140}", body)
         say(f"  执行记录行: {m.group(0) if m else '未找到'}")
 
-        page.screenshot(path=str(ROOT / "_plan_ui.png"), full_page=False)
+        page.screenshot(path=str(_OUT_DIR / "_plan_ui.png"), full_page=False)
         say("")
         say(f"控制台异常: {len(errors)} {errors[:3]}")
         browser.close()

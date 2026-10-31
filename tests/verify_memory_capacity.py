@@ -66,5 +66,8 @@ finally:
         out.append("已还原原记忆库（%d 字符，%d 条明细）"
                    % (len(backup), memory.size()))
 
-Path("_memc.txt").write_text("\n".join(out), encoding="utf-8")
+# 产物写到 .trash_tmp/，不在工程根目录留草稿（工作区卫生）
+_OUT = _pl.Path(__file__).resolve().parent.parent / ".trash_tmp"
+_OUT.mkdir(exist_ok=True)
+(_OUT / "_memc.txt").write_text("\n".join(out), encoding="utf-8")
 print("done")

@@ -25,13 +25,26 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright
 
+# hero 的「N 步」与本地这份代码的环节数一致，不写死（加了「假设生成」后本地 13 格）。
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from paper2lab.toolbox import STEPS  # noqa: E402
+_EXPECT_STEPS = f"{len(STEPS)} 步"
+
 URL = "https://paper2lab.streamlit.app/"
 SHOT = Path(r"C:\Users\lijiahui\Desktop\Paper2Lab_线上首屏.png")
 SHOT_E2E = Path(r"C:\Users\lijiahui\Desktop\Paper2Lab_线上审计结果.png")
 DUMP = Path(r"C:\Users\lijiahui\Desktop\Paper2Lab测试集\ui_screenshots") / "live_dom_dump.html"
 
 GATE_TEXT = "访问口令"            # 口令门存在时的标志
-MAIN_TEXT = "使用内置演示数据"     # 进入主界面后的标志
+
+# 进入主界面后的标志。**必须新旧两套都认**（2026-10-28 踩坑）：
+#   新版（本地工作区）上传区标题 =「上传论文资料」
+#   9 月旧版（线上 origin/main）上传区标题 =「上传三个载体」，正文里没有「上传论文资料」，
+#   但演示开关一直在 =「使用内置演示数据」。
+# 只认新版时会产出一个假红「首屏判定：❌ 未识别到预期首屏」，把真正该看的
+# hero 步数不一致（线上旧版 12 / 本地 15）埋掉。命中哪一套会打印出来，信息不丢。
+MAIN_TEXTS = ("上传论文资料", "使用内置演示数据", "上传三个载体")
+MAIN_TEXT = MAIN_TEXTS[0]          # 向后兼容旧引用；判命中请用 MAIN_TEXTS
 RUN_TEXT = "开始科研审计"          # 运行按钮（比对时会去掉空格）
 DONE_TEXT = "一致性证据"           # 结果页标签页（app.py:1122）
 # 注意：**不能**拿"风险项"当完成标志 —— 顶部导航栏里就有这四个字，
@@ -157,7 +170,8 @@ def main() -> int:
         t0 = time.time()
         page.goto(URL, wait_until="domcontentloaded", timeout=180_000)
 
-        if wake_if_sleeping(page):
+        slept = wake_if_sleeping(page)
+        if slept:
             print("⚠️ 实例处于休眠状态，已代点『Yes, get this app back up!』唤醒…")
             page.wait_for_timeout(6000)
 
@@ -166,6 +180,7 @@ def main() -> int:
             # 第二次机会：慢网络下休眠页可能比第一轮轮询更晚才出现。
             # 不给第二次机会的话，一次漏判就要白等满超时才失败。
             print("⚠️ 二次识别到休眠页，再次代点『Yes, get this app back up!』唤醒…")
+            slept = True
             page.wait_for_timeout(6000)
             frame = find_app_frame(page, timeout_ms=180_000)
         if frame is None:
@@ -181,10 +196,11 @@ def main() -> int:
             return 1
         print(f"应用 iframe: {frame.url}")
 
-        hit, text, waited = wait_text(frame, [GATE_TEXT, MAIN_TEXT], 180_000)
+        needles = [GATE_TEXT, *MAIN_TEXTS]
+        hit, text, waited = wait_text(frame, needles, 180_000)
         if not hit:
             print("首屏未出现，再等 60s 复查…")
-            hit, text, _ = wait_text(frame, [GATE_TEXT, MAIN_TEXT], 60_000)
+            hit, text, _ = wait_text(frame, needles, 60_000)
         print(f"首屏耗时 : {time.time() - t0:.1f}s（其中等待 {waited / 1000:.1f}s）")
         print(f"页面标题 : {page.title()}")
         print("=" * 64)
@@ -220,17 +236,23 @@ def main() -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"密钥框检查失败：{exc}")
 
+        is_main = hit in MAIN_TEXTS
         if hit == GATE_TEXT:
             print("首屏判定：✅ 部署成功，口令门生效")
-        elif hit == MAIN_TEXT:
+        elif is_main:
             print("首屏判定：✅ 部署成功，但**没有口令门**（拿到链接即可使用）")
+            # 命中哪套文案 = 线上跑的是哪个版本，打印出来，别让信息丢。
+            if "上传论文资料" in (text or ""):
+                print("         线上文案：新版（与本地工作区一致）")
+            else:
+                print("         线上文案：9 月旧版（「上传三个载体」）⇒ 本地未推送")
         else:
             print("首屏判定：❌ 未识别到预期首屏")
             browser.close()
             return 1
 
         ok_e2e = True
-        if hit == MAIN_TEXT and do_e2e:
+        if is_main and do_e2e:
             print("=" * 64)
             print("▶ 端到端：在线上跑一遍内置演示…")
             t1 = time.time()
@@ -255,17 +277,23 @@ def main() -> int:
                 except Exception as exc:  # noqa: BLE001
                     print(f"截图失败：{exc}")
 
-        # 需求单第 2 项：hero 必须**真的**渲染出「12 步」。
+        # 需求单第 2 项：hero 必须**真的**渲染出「N 步」（N 与本地 STEPS 同源）。
         # 上面的"无未求值占位符"只是**代理断言**：万一 hero 压根没渲染出来
         # （首屏正文没取全 / 组件被删），它会空跑通过、给出假绿。
         # 所以这里补一条正向命中断言；只在主界面分支生效（口令门分支没有 hero）。
         hero_ok = True
-        if hit == MAIN_TEXT:
-            hero_ok = "12 步" in (text or "")
+        if is_main:
+            hero_ok = _EXPECT_STEPS in (text or "")
             if hero_ok:
-                print("✅ hero 渲染出「12 步」（不是 {len(STEPS)} 占位符）")
+                print(f"✅ hero 渲染出「{_EXPECT_STEPS}」（不是未求值的占位符）")
             else:
-                print("❌ hero 未出现「12 步」—— 疑似漏 f 前缀回归，或首屏正文没取全")
+                print(f"❌ hero 未出现「{_EXPECT_STEPS}」—— "
+                      "疑似漏 f 前缀回归、首屏正文没取全，或线上未与本地同步")
+                # 把线上实际渲染的 hero 步数打出来，直接区分"回归"与"没推送"
+                m = re.search(r"(\d+)\s*步", text or "")
+                if m:
+                    print(f"         线上实际显示：「{m.group(0)}」⇒ 数字正常渲染，"
+                          "是版本落后（未推送），不是漏 f 前缀")
 
         if errors:
             print("页面异常：")

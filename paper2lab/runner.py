@@ -16,7 +16,13 @@ from typing import Callable, Optional
 
 from .models import CodeInfo
 from .planner import make_plan
-from .toolbox import STEPS, TOOLS, Job
+from .toolbox import (ABLATION_LOCKED, STEPS, TOOL_BY_KEY, TOOLS, Job,
+                      attach_chemistry, attach_experiments, attach_figures,
+                      attach_hypotheses, ensure_chemistry)
+
+#: 消融档位跳过的统一理由 —— 执行记录里要一眼看出「不是调度员判断不值得跑」，
+#: 而是「评测时人为少开了一项能力」。措辞同步进报告与评测报告，别各处另写一句。
+ABLATION_SKIP_REASON = "消融档位：本次评测**有意**未开这项能力（3C）"
 
 
 @dataclass
@@ -58,9 +64,30 @@ class ExecutionLog:
 
 def _fill_empty(job: Job, tool_key: str) -> None:
     """被跳过的工具留下的空产物 —— 语义要与"跑了但没结果"一致。"""
-    if tool_key == "analyze_code":
+    if tool_key == "hypothesize":
+        # 被跳过 = 没有论文（或材料太残缺到不值得提假设）。空列表的语义是
+        # "这次没提出假设"，**不是**"提了但没提出来" —— 这两者在界面上必须说得清。
+        job.hypotheses = []
+        job.hypothesis_total = 0
+        if job.audit is not None:
+            job.audit.hypotheses = []
+    elif tool_key == "design_experiment":
+        # 被跳过 = 没有假设卡（或材料太残缺到不值得设计实验）。空列表的语义是
+        # "这次没做实验"，**不是**"做了但一张卡都没出"。
+        job.experiments = []
+        job.experiment_total = 0
+        if job.audit is not None:
+            job.audit.experiments = []
+    elif tool_key == "analyze_code":
         if job.code is None:
             job.code = CodeInfo()
+    elif tool_key == "read_figures":
+        # 被跳过 = 没有论文（或材料太残缺到不值得读图）。空列表的语义是
+        # "本次没读到图表线索"，**不是**"读了但一条都没读到"。
+        job.figure_clues = []
+        job.figure_total = 0
+        if job.audit is not None:
+            job.audit.figure_clues = []
     elif tool_key == "rootcause":
         # 被跳过 = 没有代码包。空列表的语义正是"没有可追的项", 不是"追了没追到"。
         job.rootcause = []
@@ -70,6 +97,18 @@ def _fill_empty(job: Job, tool_key: str) -> None:
         job.patches = []
         if job.audit is not None:
             job.audit.patches = []
+    elif tool_key == "selfcheck":
+        # 阶段三 3C：自检被**档位**跳过时，必须留下"这次没判"的明确信号。
+        # 为什么不能就这样放着: `Finding.verified` 的默认值是 True，
+        # 不写这一笔的话，一份"根本没做自证"的答卷会被读成"全部自证通过"——
+        # 那是把没测的东西报成满分, 比缺指标更坏。
+        # 只加新键（skipped=True）＋ 计数归零，不改既有键语义（L8）。
+        if job.audit is not None:
+            job.audit.selfcheck = {"passed": 0, "checked": 0, "failed": 0,
+                                   "skipped": True,
+                                   "note": ABLATION_SKIP_REASON}
+            job.audit.coverage = dict(getattr(job.audit, "coverage", {}) or {})
+            job.audit.coverage["skipped"] = True
     elif tool_key == "analyze_images":
         if job.paper is not None:
             job.paper.image_params = {}
@@ -80,9 +119,13 @@ def _fill_empty(job: Job, tool_key: str) -> None:
             }
 
 
-def run_job(job: Job, *, progress: Optional[Callable[[int, str], None]] = None,
-            plan_mode: bool = False) -> ExecutionLog:
-    """按计划执行全部工具, 返回执行记录。"""
+def run_job(job: Job, *, progress: Optional[Callable[[int, str], None]] = None) -> ExecutionLog:
+    """按计划执行全部工具, 返回执行记录。
+
+    2026-10-25 起**只有一条路**: 先排计划（模型能排就模型排, 否则规则版兜底）再执行。
+    原先的"经典模式"（不看材料、固定全序全跑）已按用户口径删除 ——
+    它只是把"没代码也扫一遍代码"这种无效动作固化下来，留着只会让结论口径分叉。
+    """
     # 跨任务记忆(第二期第三批): 只读"线索"用于提示, 不改变任何执行决策
     if job.fingerprint:
         try:
@@ -112,7 +155,7 @@ def run_job(job: Job, *, progress: Optional[Callable[[int, str], None]] = None,
         job.paper, job.code = job.snapshot
         job.snapshot_reused = True
 
-    plan = make_plan(job, plan_mode=plan_mode, use_llm=job.llm_planner)
+    plan = make_plan(job, use_llm=job.llm_planner)
     log = ExecutionLog(mode=plan.mode, notes=list(plan.notes),
                        plan=plan.to_dict())
 
@@ -129,9 +172,29 @@ def run_job(job: Job, *, progress: Optional[Callable[[int, str], None]] = None,
         progress(idx, f"{name}{suffix}")
 
     action_of = {d.tool: d for d in plan.decisions}
-    t_all = time.time()
+    # 消融档位（3C）：人为少开的能力。放在循环之前校验 —— 档位写错要当场炸，
+    # 不能等跑完半套才发现「跳的是不存在的工具」或「把底座跳了」。
+    forced = tuple(job.skip_tools or ())
+    for _k in forced:
+        assert _k in TOOL_BY_KEY, f"消融档位里出现了不存在的工具键: {_k}"
+        assert _k not in ABLATION_LOCKED, f"工具 {_k} 是消融受保护的底座，不许跳"
+    forced_set = set(forced)
+    if forced:
+        log.notes.append(
+            "🧪 消融档位：" + "、".join(TOOL_BY_KEY[k].title for k in forced)
+            + " 本档**未开启**（如实记，不是没跑出来）")
+    t_all = time.monotonic()
 
     for tool in TOOLS:
+        if tool.key in forced_set:
+            _fill_empty(job, tool.key)
+            log.steps.append(StepRecord(
+                key=tool.key, title=tool.title, status="skipped",
+                reason=ABLATION_SKIP_REASON, checkpoints=tool.checkpoints))
+            for cp in tool.checkpoints:
+                _tick(cp, "（消融档位跳过）")
+            continue
+
         decision = action_of.get(tool.key)
 
         if decision is not None and decision.action == "skip":
@@ -151,7 +214,7 @@ def run_job(job: Job, *, progress: Optional[Callable[[int, str], None]] = None,
                 key=tool.key, title=tool.title, status="failed",
                 reason=f"{type(ex).__name__}: {ex}",
                 seconds=time.time() - t0, checkpoints=tool.checkpoints))
-            log.seconds = time.time() - t_all
+            log.seconds = time.monotonic() - t_all
             job.execution_log = log.to_dict()
             if job.audit is not None:
                 job.audit.execution_log = job.execution_log
@@ -160,10 +223,30 @@ def run_job(job: Job, *, progress: Optional[Callable[[int, str], None]] = None,
             key=tool.key, title=tool.title, status="done",
             seconds=time.time() - t0, checkpoints=tool.checkpoints))
 
-    log.seconds = time.time() - t_all
+    log.seconds = time.monotonic() - t_all
     job.execution_log = log.to_dict()
     if job.audit is not None:
         job.audit.execution_log = job.execution_log
+        # 阶段二 2A：① 假设站的产物挂到 audit —— 与图版 node_finalize、与报告生成前
+        # 走的是**同一个函数**（toolbox.attach_hypotheses），界面 / 报告只读
+        # audit.hypotheses 一处，不分经典版 / 图版（分了就一定漂移）。
+        attach_hypotheses(job.audit, job.hypotheses, job.hypothesis_total,
+                          getattr(job, "derivation_note", None))
+        # 阶段二 2D：② 实验站的产物同款挂法 —— 与图版 finalize、与报告生成前走同一个函数，
+        # 界面 / 报告只读 audit.experiments 一处，不分经典版 / 图版。
+        attach_experiments(job.audit, job.experiments, job.experiment_total,
+                           getattr(job, "experiment_note", None))
+        # 阶段二 2E：① 假设站「读」这一步的图表线索同款挂法。
+        attach_figures(job.audit, job.figure_clues, job.figure_total,
+                       getattr(job, "figure_note", None))
+        # 阶段二 2E-化学：独立工具 chem_check 的产物同款挂法（同一函数, 不分经典/图版）。
+        # ⚠ 挂之前必须 ensure_chemistry：模型**可以单独跳过**这一步（决策权在它），
+        #   但不许结果静默消失 —— 跳过就补算，并标 fallback 如实写明「该步被跳过」。
+        ensure_chemistry(job)
+        attach_chemistry(job.audit, getattr(job, "chem_items", None),
+                         getattr(job, "chem_total", 0),
+                         getattr(job, "chem_note", None),
+                         fallback=bool(getattr(job, "chem_fallback", False)))
 
     # 写入记忆: **只写线索**(哪些参数出现在哪些页/哪条通道/哪些已确认无解), 不写任何取值
     if job.fingerprint and job.audit is not None:

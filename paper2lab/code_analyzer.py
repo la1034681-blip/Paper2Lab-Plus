@@ -404,12 +404,18 @@ def analyze_code(source: Union[str, Path]) -> CodeInfo:
     req_text: Optional[str] = None
 
     src = str(source)
-    if not src.strip() or not Path(src).exists():
-        # 空路径 / 不存在的路径: 明确返回"无代码", 绝不落到下面的目录分支。
+    if not src.strip():
+        # 没给代码包: 语义是「这次没有代码」, 返回空结果, 不报错。
         # 原因: Path("") 等于 Path(".") —— 会把**当前工作目录**(含 .venv、临时文件、
         # 甚至本项目的 .env) 当成"论文的代码"整目录扫描, 既产生荒唐结论,
         # 又有读到敏感文件的风险。2026-09-27 实测: 缺代码包时会扫出 5874 个 .py。
         return info
+    if not Path(src).exists():
+        # 给了路径却不存在 = **用户填错了** —— 必须明确报错。
+        # 2026-10-29 修: 原来与"没给"合并处理, 静默返回空 CodeInfo,
+        # 用户会以为"代码里确实没有这些参数", 实际是路径根本没指到东西。
+        # 口径与论文侧一致（见 paper_parser.parse_paper 的 FileNotFoundError）。
+        raise FileNotFoundError(f"代码包路径不存在: {src}")
 
     def _collect(rel: str, low: str, text: str):
         nonlocal req_text
@@ -435,6 +441,11 @@ def analyze_code(source: Union[str, Path]) -> CodeInfo:
                 ml_sources.append((rel, lang, text))
 
     if src.lower().endswith(".zip"):
+        if not zipfile.is_zipfile(src):
+            # 不是有效的 zip(空文件、下到一半、被改名成 .zip 的文本):
+            # 与「没给代码包」同等处理 —— 返回空 CodeInfo, 让上层按"无代码"走,
+            # 而不是把 BadZipFile 抛到界面上(那会整页崩掉)。
+            return info
         with zipfile.ZipFile(src) as zf:
             for name in zf.namelist():
                 if name.endswith("/"):

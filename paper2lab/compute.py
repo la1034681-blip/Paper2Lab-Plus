@@ -183,19 +183,42 @@ def _num(vals: dict, key: str) -> Optional[float]:
 
 @dataclass
 class Relation:
-    """一条可复算的参数关系式。
+    """一条可复算的参数关系式 —— **执行与判定分两段**（阶段二 2C）。
 
     gather(pv, cv) -> (inputs, reason)
       pv / cv 是两侧的侧值表；inputs 是算好的输入字典，reason 是"差什么"。
       返回 inputs=None 表示这次不适用，reason 会被如实写进结果（不静默跳过）。
-    judge(inputs) -> dict
-      把输入判成一个结论（verdict / expected / actual / detail / confidence）。
+    run(inputs) -> dict
+      **② 实验站的活**：把两侧的数代进公式，**只产出 expected / actual 两个数**，
+      不碰 verdict（不给结论、不贴标签）。跑不出来就抛异常或回 {"undecidable": 理由}。
+    judge(measured) -> dict
+      **③ 验证站的活**：拿 ② 已经跑出来的数**下判断**（一致 / 对不上 / 推测 / 仅推演），
+      **不重新算数** —— 判定函数只能看 measured 里已有的数，缺哪个就如实说缺。
+
+    分两段是为了让「③不造数」这条红线在**代码结构上**成立：
+    以前 judge 一次返回 actual＋verdict，判定和算数混在一个函数里，
+    说"判定不造数"只能靠注释；现在 run 是唯一的算数口，judge 无权产出数。
     """
     rid: str
     title: str
     formula: str
     gather: Callable[[dict, dict], tuple]
     judge: Callable[[dict], dict]
+    run: Optional[Callable[[dict], dict]] = None   # ② 算数；缺省时回落成 judge 兼办（旧关系式兼容）
+
+    def measure(self, inputs: dict) -> dict:
+        """统一入口：返回**只有数、没有结论**的测量结果。"""
+        if callable(self.run):
+            return self.run(inputs)
+        # 旧关系式没拆：judge 兼算数兼判定，这里跑一次再把结论剔掉。
+        res = dict(self.judge(inputs) or {})
+        for k in ("verdict", "detail", "confidence"):
+            res.pop(k, None)
+        return res
+
+    def decide(self, measured: dict) -> dict:
+        """统一入口：只下判断。拆过的走 judge；没拆的走兼容路径（judge 再跑一次取结论）。"""
+        return self.judge(measured)
 
 
 def _g_warmup(pv: dict, cv: dict) -> tuple:
@@ -224,25 +247,50 @@ def _g_warmup(pv: dict, cv: dict) -> tuple:
             "total_steps": total, "ratio_side": "paper" if wp <= 1.0 else "code"}, ""
 
 
-def _j_warmup(inp: dict) -> dict:
-    base = {"rid": "warmup_unit", "expected": None, "actual": None,
-            "confidence": "confirmed"}
+def _r_warmup(inp: dict) -> dict:
+    """② 站：warmup 的**换算** —— 只算数，不下结论。
+
+    两种情形都把 expected / actual 摆齐：
+      · convert   → expected = 步数 ÷ 总步数（公式算出来的），actual = 另一侧声明的比例
+      · same_scale → 两侧同为比例或同为步数，expected=None（无从比较，如实留空）
+    判"一致 / 对不上"是 ③ 站的活，这里不碰 verdict。
+    """
     if inp.get("mode") == "same_scale":
+        return {"expected": None, "actual": None,
+                "both_same_scale": True,
+                "note_shape": ("比例" if inp["paper"] <= 1.0 else "步数"),
+                "paper": inp["paper"], "code": inp["code"],
+                "total_steps": inp.get("total_steps")}
+    return {"expected": inp["steps"] / inp["total_steps"],   # 由「步数侧」推出来的比例
+            "actual": inp["ratio"],                            # 「比例侧」自己声明的比例
+            "both_same_scale": False,
+            "steps": inp["steps"], "total_steps": inp["total_steps"],
+            "ratio_side": inp.get("ratio_side", "")}
+
+
+def _j_warmup(measured: dict) -> dict:
+    """③ 站：拿 ② 跑出来的数**下判断** —— 本函数不读两侧参数表，也不再做除法。"""
+    base = {"rid": "warmup_unit", "confidence": "confirmed",
+            "expected": measured.get("expected"), "actual": measured.get("actual")}
+    if measured.get("both_same_scale"):
         base.update(verdict="info",
-                    detail=(f"两侧 warmup 同为{'比例' if inp['paper'] <= 1.0 else '步数'}形态"
-                            f"（{inp['paper']} / {inp['code']}），无需换算 —— 直接按字面比对即可"))
+                    detail=(f"两侧 warmup 同为{measured.get('note_shape', '比例')}形态"
+                            f"（{measured.get('paper', '—')} / {measured.get('code', '—')}），"
+                            f"无需换算 —— 直接按字面比对即可"))
         return base
-    exp = inp["steps"] / inp["total_steps"]      # 由「步数侧」推出来的比例
-    act = inp["ratio"]                            # 「比例侧」自己声明的比例
-    base.update(expected=exp, actual=act)
+    exp, act = base["expected"], base["actual"]
+    steps, total = measured.get("steps"), measured.get("total_steps")
+    if exp is None or act is None:
+        base.update(verdict="info", detail="② 站没有给出可比的数（缺 expected 或 actual），本次不下结论")
+        return base
     if abs(exp - act) <= max(1e-9, 1e-6 * max(abs(exp), abs(act), 1.0)):
         base.update(verdict="consistent",
-                    detail=(f"{inp['steps']:g} 步 ÷ {inp['total_steps']:g} 总步数 = {exp:.4g}，"
+                    detail=(f"{steps:g} 步 ÷ {total:g} 总步数 = {exp:.4g}，"
                             f"与另一侧声明的比例 {act:.4g} 一致 —— "
                             "两者是同一件事的两种写法"))
     else:
         base.update(verdict="mismatch",
-                    detail=(f"按总步数 {inp['total_steps']:g} 换算应为 {exp:.4g}，"
+                    detail=(f"按总步数 {total:g} 换算应为 {exp:.4g}，"
                             f"实际声明 {act:.4g} —— 换算后仍然对不上"))
     return base
 
@@ -257,11 +305,22 @@ def _g_steps_per_epoch(pv: dict, cv: dict) -> tuple:
     return {"epochs": epochs, "total_steps": total}, ""
 
 
-def _j_steps_per_epoch(inp: dict) -> dict:
-    v = inp["total_steps"] / inp["epochs"]
+def _r_steps_per_epoch(inp: dict) -> dict:
+    """② 站：由「轮数 + 总步数」算出每轮步数 —— 纯除法，没有预期值可比。"""
+    return {"expected": None, "actual": inp["total_steps"] / inp["epochs"],
+            "epochs": inp["epochs"], "total_steps": inp["total_steps"]}
+
+
+def _j_steps_per_epoch(measured: dict) -> dict:
+    """③ 站：给推演值贴标签 —— 只有 actual、没有 expected，因此**只能标「推演」不作为结论**。"""
+    v = measured.get("actual")
+    if v is None:
+        return {"rid": "steps_per_epoch", "expected": None, "actual": None,
+                "verdict": "info", "confidence": "none",
+                "detail": "② 站没有算出每轮步数（输入缺轮数或总步数），本次不下结论"}
     return {"rid": "steps_per_epoch", "expected": None, "actual": v,
             "verdict": "info", "confidence": "inferred",
-            "detail": (f"{inp['total_steps']:g} 总步数 ÷ {inp['epochs']:g} 轮 ≈ {v:g} 步/轮"
+            "detail": (f"{measured['total_steps']:g} 总步数 ÷ {measured['epochs']:g} 轮 ≈ {v:g} 步/轮"
                        "（推演值，供人工核对，不作为结论）")}
 
 
@@ -277,34 +336,46 @@ def _g_lr_scaling(pv: dict, cv: dict) -> tuple:
     return vals, ""
 
 
-def _j_lr_scaling(inp: dict) -> dict:
-    lr_r = inp["lr_code"] / inp["lr_paper"]
-    bs_r = inp["bs_code"] / inp["bs_paper"]
-    base = {"rid": "lr_scaling", "expected": bs_r, "actual": lr_r,
-            "confidence": "inferred"}
-    if abs(lr_r - bs_r) <= max(1e-9, 0.02 * max(abs(lr_r), abs(bs_r), 1.0)):
+def _r_lr_scaling(inp: dict) -> dict:
+    """② 站：量出两个倍率 —— 批大小几倍、学习率几倍。**不判断它们是否吻合。**"""
+    return {"expected": inp["bs_code"] / inp["bs_paper"],     # 批大小倍率
+            "actual": inp["lr_code"] / inp["lr_paper"],        # 学习率倍率
+            "lr_paper": inp["lr_paper"], "lr_code": inp["lr_code"],
+            "bs_paper": inp["bs_paper"], "bs_code": inp["bs_code"]}
+
+
+def _j_lr_scaling(measured: dict) -> dict:
+    """③ 站：只比两个倍率像不像 —— 不重算倍率。"""
+    exp, act = measured.get("expected"), measured.get("actual")
+    base = {"rid": "lr_scaling", "confidence": "inferred",
+            "expected": exp, "actual": act}
+    if exp is None or act is None:
+        base.update(verdict="info", detail="② 站没有量出两个可比的倍率，本次不下结论")
+        return base
+    if abs(act - exp) <= max(1e-9, 0.02 * max(abs(act), abs(exp), 1.0)):
         base.update(verdict="hint",
-                    detail=(f"批大小放大 {bs_r:.4g} 倍、学习率放大 {lr_r:.4g} 倍，两者吻合 —— "
+                    detail=(f"批大小放大 {exp:.4g} 倍、学习率放大 {act:.4g} 倍，两者吻合 —— "
                             "疑似**刻意按批大小线性缩放**，不是写错（需人工确认，"
                             "不作为确定性结论）"))
     else:
         base.update(verdict="info",
-                    detail=(f"批大小放大 {bs_r:.4g} 倍、学习率放大 {lr_r:.4g} 倍，"
+                    detail=(f"批大小放大 {exp:.4g} 倍、学习率放大 {act:.4g} 倍，"
                             "两者不吻合 —— 线性缩放解释不成立"))
     return base
 
 
 # 登记表: 加一条关系式只要在这里加一项（并补测试），下游代码一行不改。
+# run = ② 站算数；judge = ③ 站判定（2C 起两段分开，run 可缺省但建议补上）。
 RELATIONS: tuple = (
     Relation(rid="warmup_unit", title="warmup 步数 ↔ 比例 换算核验",
              formula="warmup_steps / total_steps ?= warmup_ratio",
-             gather=_g_warmup, judge=_j_warmup),
+             gather=_g_warmup, run=_r_warmup, judge=_j_warmup),
     Relation(rid="steps_per_epoch", title="每轮步数推演",
              formula="steps_per_epoch = total_steps / epochs",
-             gather=_g_steps_per_epoch, judge=_j_steps_per_epoch),
+             gather=_g_steps_per_epoch, run=_r_steps_per_epoch, judge=_j_steps_per_epoch),
     Relation(rid="lr_scaling", title="学习率 × 批大小 线性缩放推演",
              formula="lr_code / lr_paper ?= batch_code / batch_paper",
-             gather=_g_lr_scaling, judge=_j_lr_scaling),
+             gather=_g_lr_scaling, run=_r_lr_scaling, judge=_j_lr_scaling),
 )
 
 _VERDICT_LABEL = {
@@ -341,12 +412,24 @@ class ComputeReport:
         md = ["## 「算」小规模复算与静态推演", "",
               "> 只做「把已知的数代进已知公式」的小规模复算与静态推演；",
               "> **不执行任何训练、不运行用户代码**。输入不全的一律如实记为「未算」，",
-              "> 不用默认值补出一个数。", ""]
+              "> 不用默认值补出一个数。", "",
+              "> **执行与判定分开（2C）**：② 实验站只负责把数算出来，",
+              "> ③ 验证站只负责下结论 —— 判定环节拿不到两侧原始参数，**没有能力造数**。", ""]
         if self.relations:
-            md += ["| 关系式 | 结果 | 说明 |", "| --- | --- | --- |"]
+            md += ["| 关系式 | ② 算出的数 | 结果 | 说明 |",
+                   "| --- | --- | --- | --- |"]
             for r in self.relations:
                 lab = _VERDICT_LABEL.get(r.get("verdict", ""), r.get("verdict", ""))
-                md.append(f"| `{r.get('formula', '')}` | {lab} | {r.get('detail', '')} |")
+                exp, act = r.get("expected"), r.get("actual")
+                if exp is None and act is None:
+                    nums = "—（未算出）"
+                elif exp is None:
+                    nums = f"实得 {act:.6g}" if isinstance(act, (int, float)) else f"实得 {act}"
+                else:
+                    e = f"{exp:.6g}" if isinstance(exp, (int, float)) else str(exp)
+                    a = f"{act:.6g}" if isinstance(act, (int, float)) else str(act)
+                    nums = f"预期 {e} / 实得 {a}"
+                md.append(f"| `{r.get('formula', '')}` | {nums} | {lab} | {r.get('detail', '')} |")
             md.append("")
         if self.magnitudes:
             md += ["**量纲提示**", ""]
@@ -363,10 +446,15 @@ class ComputeReport:
 
 def check_relations(paper_params: Any = None, code_params: Any = None,
                     *, relations: Optional[tuple] = None) -> ComputeReport:
-    """对一对参数表跑一遍登记的关系式。
+    """对一对参数表跑一遍登记的关系式 —— **② 算数 → ③ 判定，两段分开记账**。
 
     输入可以是 `PaperInfo.params` / `CodeInfo.params`，也可以是 `{key: 值}` 的简写
     （对撞区视图与测试里都用得上）。
+
+    2C 的分工（写在代码结构里，不只写在注释里）：
+      ① `gather` 收输入 → ② `run` 出**数**（expected / actual）→ ③ `judge` 只下**结论**。
+      判定阶段拿不到两侧参数表，也就**没有能力重新造数** —— 「③不造数」由此成立。
+      ② 算数失败时如实记「未算」并跳到下一条，**不用默认值补数**。
     """
     pv, cv = _side_values(paper_params), _side_values(code_params)
     rep = ComputeReport()
@@ -381,19 +469,42 @@ def check_relations(paper_params: Any = None, code_params: Any = None,
                 "rid": rel.rid, "title": rel.title, "formula": rel.formula,
                 "verdict": "skipped", "expected": None, "actual": None,
                 "confidence": "none", "inputs": {},
+                "computed_by": "② 实验站", "judged_by": "",
                 "detail": f"本次未算：{reason}（不用默认值补数）",
             })
             continue
+        # ---- ② 算数：只出数，不出结论
         try:
-            res = rel.judge(inputs)
+            measured = rel.measure(inputs)
+        except Exception as ex:      # noqa: BLE001
+            rep.skipped += 1
+            rep.notes.append(f"关系式 {rel.rid} 算数失败: {type(ex).__name__}: {ex}")
+            continue
+        measured = dict(measured or {})
+        measured.setdefault("rid", rel.rid)
+        measured.setdefault("expected", None)
+        measured.setdefault("actual", None)
+        # ---- ③ 判定：拆过的只看 measured 里的数（拿不到 inputs, 也就没法造数）；
+        #      没拆的旧关系式还得靠 inputs 才能跑（兼容路径, 判据靠标注而非结构）。
+        _for_judge = measured if callable(rel.run) else inputs
+        try:
+            res = rel.decide(_for_judge)
         except Exception as ex:      # noqa: BLE001
             rep.skipped += 1
             rep.notes.append(f"关系式 {rel.rid} 判定失败: {type(ex).__name__}: {ex}")
             continue
         rep.checked += 1
+        res = dict(res or {})
         res.setdefault("title", rel.title)
         res.setdefault("formula", rel.formula)
+        # 判定函数的产出**只允许**有结论与措辞；数一律以 ② 站算出的为准（L8：不被判定改写）
+        res["expected"] = measured.get("expected")
+        res["actual"] = measured.get("actual")
+        res["measured"] = {k: v for k, v in measured.items()
+                           if isinstance(v, (int, float)) and not isinstance(v, bool)}
         res["inputs"] = {k: v for k, v in inputs.items() if isinstance(v, (int, float))}
+        res["computed_by"] = "② 实验站"
+        res["judged_by"] = "③ 验证站"
         rep.relations.append(res)
         if res.get("verdict") in ("mismatch", "hint"):
             rep.flagged += 1

@@ -15,10 +15,15 @@
    "只有 AI 推断、没有原文出处"。**与 `selfcheck` 的「证据自证」是两个维度**：
    selfcheck 查的是"证据自己是否自洽"（snippet 里真的含这个值），
    这里查的是"这条结论的出处够不够、能不能被独立复查"，两者互补不重复。
-3. **外部文献检索（可选钩子，默认关闭）**
-   要接 MindSearch / 端砚这类外部检索时从这里进。**默认关闭**：
-   项目线上是无 key 的零成本配置，且外部检索结果**一律标未核验**，
-   不能混进确定性结论——没启用就如实说"未启用"，不假装搜过。
+3. **外部文献检索（默认走真实多源检索，见 `literature.py`）**
+   原来这里是个"让模型凭记忆写几篇文献"的钩子 —— 那本质是让模型背课文，
+   写出来的东西无法证实存在，是最该防的幻觉源。现在默认走 `literature.search()`：
+   并发查 6 个公开学术索引（OpenAlex / Crossref / Europe PMC / arXiv / DataCite /
+   DOAJ），DOI 去重后按相关度返回，**每条都能点开核**。
+   模型钩子 `external_search()` 保留为可选补全（`PAPER2LAB_LIT=off` 时的老路径），
+   两者的返回项一律 `unverified=True`。
+   **边界**：文献真实存在 ≠ 它支持这条结论。前者机器能证，后者只能人读——
+   所以外部线索永远不混进确定性结论，也不参与任何判定。
 
 **两条边界**：
 1. 检索是**字面检索**（同义词扩展 + 取值命中），不是语义检索。
@@ -36,7 +41,7 @@ from .synonyms import PARAM_SYNONYMS, canonical_key
 
 __all__ = [
     "search_paper", "cite_findings", "verify_citations",
-    "external_search", "CitationReport", "SEARCH_MODE",
+    "external_search", "literature_search", "CitationReport", "SEARCH_MODE",
 ]
 
 # 检索方式的自述（写进结果里，避免对外被说成"语义检索"）
@@ -170,6 +175,23 @@ class CitationReport:
                 md.append(f"| {it.get('display') or it.get('param_key')} | "
                           f"{it.get('primary_source') or '—'} | {first} |")
             md.append("")
+        ext = self.external or {}
+        if ext.get("items"):
+            md += ["", "### 外部文献候选（真实存在，但是否支持该结论需人读确认）", "",
+                   f"> 检索方式：{ext.get('mode') or '外部检索'}。"
+                   f"下面 {len(ext['items'])} 条都能点开核，但**没有一条被机器判为"
+                   "「支持某条结论」**，请当作候选依据使用。", "",
+                   "| 年份 | 标题 | 收录库 | 链接 |", "| --- | --- | --- | --- |"]
+            for it in ext["items"]:
+                title = str(it.get("title") or "").replace("|", "／")[:80]
+                link = it.get("doi") or it.get("url") or "—"
+                if it.get("doi"):
+                    link = f"[{it['doi']}](https://doi.org/{it['doi']})"
+                md.append(f"| {it.get('year') or '—'} | {title} | "
+                          f"{', '.join(it.get('found_in') or []) or '—'} | {link} |")
+            md.append("")
+        elif ext.get("enabled"):
+            md += ["", f"> 外部文献：{ext.get('note') or '本次没有检索到相关文献'}"]
         if self.notes:
             md += [f"- {n}" for n in self.notes]
         return "\n".join(md)
@@ -245,7 +267,8 @@ def cite_findings(audit: Any, *, top_k: int = 2) -> CitationReport:
         "inferred_only": inferred_only, "mismatched": mismatched,
     }
     rep.notes.append(
-        "「搜」本次只做论文内部字面检索 + 引证核验；外部文献检索默认关闭（零成本配置）。")
+        "「搜」分两条腿：论文内部字面检索（证明哪一页写了什么，本地零成本）"
+        "＋ 外部文献检索（真实多源查询，结果只当候选依据，不参与任何判定）。")
     if total and cited < total:
         rep.notes.append(
             f"有 {total - cited} 条结论没有可定位出处 —— 已列在 items 里，"
@@ -317,13 +340,77 @@ def external_search(intent: str, *, enabled: bool = False, chat: Optional[Callab
     return {"enabled": True, "items": items, "note": "；".join(parts)}
 
 
+def literature_search(findings: Any = None, *, query: str = "",
+                      paper_title: str = "", max_params: int = 3,
+                      limit: int = 4, **kw) -> dict:
+    """外部文献检索 —— **真实多源查询**（`literature.py` 的审计侧入口）。
+
+    两种用法：
+      · 给了 `query`   → 拿它直接查（对外 MCP 工具 / 用户手动搜都走这条）；
+      · 只给 `findings` → 由审计结论自动生成 2~3 个查询词（参数名 ＋ 论文标题实词）。
+
+    返回结构对外统一成 `{enabled, mode, items, sources, reached, note, unverified}`，
+    与旧的 `external_search()` **同名字段兼容**（`enabled` / `items` / `note`），
+    这样报告层不用改就能两种都渲染。
+    """
+    from . import literature
+
+    if not literature.enabled():
+        return {"enabled": False, "mode": literature.MODE, "items": [], "sources": [],
+                "reached": 0,
+                "note": ("外部文献检索已关闭（PAPER2LAB_LIT=off）—— 本次只做论文内部"
+                         "检索，不假装搜过。"),
+                "unverified": True}
+
+    if str(query or "").strip():
+        res = literature.search(str(query), limit=limit, **kw)
+    else:
+        res = literature.for_findings(findings or [], paper_title,
+                                      max_params=max_params, limit=limit, **kw)
+
+    items = list(res.get("items") or [])
+    if items:
+        note = res.get("note") or ""
+        tail = f"共 {len(items)} 条**未核验**候选文献，仅供人工参考"
+        note = "；".join(p for p in (note, tail) if p)
+    else:
+        note = res.get("note") or res.get("error") or "本次没有检索到相关文献"
+
+    out = {
+        "enabled": True,
+        "mode": res.get("mode") or literature.MODE,
+        "items": items,
+        "sources": sorted(res.get("providers") or {}),
+        "providers": res.get("providers") or {},
+        "reached": int(res.get("reached") or 0),
+        "of": int(res.get("of") or len(literature.PROVIDERS)),
+        "note": note,
+        # 顶层也标一次：外部线索不得当结论用（下游只看一个键时也不会漏）
+        "unverified": True,
+    }
+    for k in ("query", "queries", "per_query", "by_param", "elapsed_s", "cached"):
+        if k in res:
+            out[k] = res[k]
+    return out
+
+
 def verify_citations(audit: Any, *, top_k: int = 2,
-                     external: Optional[dict] = None) -> CitationReport:
-    """引证核验总入口：内部检索 + 出处核验 +（可选的）外部线索。"""
+                     external: Optional[dict] = None,
+                     use_literature: bool = True) -> CitationReport:
+    """引证核验总入口：内部检索 + 出处核验 + 外部文献候选。
+
+    `external` 显式给了就用它（测试桩 / 上游已查过，避免重复打网络）；
+    否则默认走真实多源检索（`use_literature=False` 可强制关掉）。
+    """
     rep = cite_findings(audit, top_k=top_k)
-    rep.external = external if external is not None else external_search(
-        "", enabled=False)
-    # 未启用时 `cite_findings` 已经在 notes 里说过一次，这里不再重复同一句话。
+    if external is not None:
+        rep.external = external
+    elif use_literature:
+        rep.external = literature_search(
+            getattr(audit, "findings", None),
+            paper_title=getattr(getattr(audit, "paper", None), "title", "") or "")
+    else:
+        rep.external = external_search("", enabled=False)
     if rep.external.get("enabled") and rep.external.get("note"):
         rep.notes.append(rep.external["note"])
     if rep.external.get("items"):

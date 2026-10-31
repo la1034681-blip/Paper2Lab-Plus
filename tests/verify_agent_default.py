@@ -6,9 +6,12 @@
 
 所以这里断言三件**端到端**的事（不是读代码里的默认值）：
   ① 页面上**没有**「要不要 AI」的开关 —— AI 参与是默认行为本身，不是选项；
-  ② 跑完之后执行记录里能看到 **AI 真的参与了排计划**（标签「🧠 AI 排计划」，
-     或 notes 里"AI 判定 N 个工具本次不值得跑"）；
-  ③ 若 AI 不可用而回退，界面必须**如实说明**（不许悄悄退回规则版还说自己是 AI 排的）。
+  ② 跑完之后执行记录里能看到 **模型真的参与了排计划**（标签「🧠 模型排计划」，
+     或 notes 里"模型判定 N 个工具本次不值得跑"）；
+  ③ 若模型不可用而回退，界面必须**如实说明**（不许悄悄退回规则版还说自己是模型排的）。
+
+注（阶段一 1C，2026-10-15）：文案从「🧠 AI 排计划」改为「🧠 模型排计划」——
+因为 1C 起排计划的**主导者就是模型**（不再是"AI 提议、程序盖章"）。
 """
 import subprocess
 import sys
@@ -26,6 +29,28 @@ def check(ok: bool, label: str) -> None:
     print(f"  [{'OK ' if ok else 'FAIL'}] {label}", flush=True)
     if not ok:
         fails.append(label)
+
+
+def goto_nav(page, label: str) -> bool:
+    """2026-10-26 界面改成「左侧导航 + 分页」后新增。
+
+    ⚠ 这一项原来靠 `if "执行记录" in body: break` 判断结果出来了 —— 改版后
+    「执行记录」这四个字在侧栏导航里恒有，条件立刻成立 ⇒ 拿总览页的文本去断言，
+    必然报"看不到模型排计划"（是等待条件被导航文案污染，不是功能坏）。
+    改成：先等结果页立住，再点导航到「执行记录」。
+    """
+    try:
+        lab = page.locator('[data-testid="stSidebarUserContent"] [role="radiogroup"] label, [data-testid="stSidebar"] [role="radiogroup"] label'
+                           ).filter(has_text=label)
+        if not lab.count():
+            return False
+        lab.first.scroll_into_view_if_needed()
+        page.wait_for_timeout(300)
+        lab.first.click()
+        page.wait_for_timeout(2500)
+        return True
+    except Exception:
+        return False
 
 
 proc = subprocess.Popen(
@@ -61,27 +86,32 @@ try:
         # ---- ① 不该再有「要不要 AI」的开关
         check("AI 参与决策" not in head,
               "页面上已无「AI 参与决策」开关（AI 参与是默认行为，不是选项）")
-        check("兜底开关" in head,
-              "「兜底开关」（经典模式）仍在 —— 它是唯一的对照口子，不是 AI 开关")
+        # 2026-10-25 起「经典模式」已按用户口径删除（只剩"先排计划再执行"一条路）。
+        # 这条断言因此**反过来守**：页面不该再出现任何模式切换开关。
+        check("兜底开关" not in head and "经典模式" not in head,
+              "页面上已无「兜底开关 / 经典模式」（只剩一条路：先排计划再执行）")
 
         # ---- ② 跑一次（演示数据默认已勾选）
         page.get_by_text("开 始 科 研 审 计", exact=False).click()
         for _ in range(120):
             page.wait_for_timeout(2000)
             body = page.inner_text("body")
-            if "执行记录" in body:
+            if "综合复现就绪度" in body:      # 结果页立住（别用「执行记录」，导航里恒有）
                 break
+        _moved = goto_nav(page, "执行记录")
+        print(f"      切到执行记录页: {_moved}", flush=True)
         page.wait_for_timeout(4000)
         body = page.inner_text("body")
 
-        ai_on = "🧠 AI 排计划" in body
-        fell_back = "AI 排计划未生效" in body
-        print(f"      含「AI 排计划」标签: {ai_on}；含「未生效」说明: {fell_back}", flush=True)
+        ai_on = "🧠 模型排计划" in body
+        fell_back = "模型排计划未生效" in body
+        print(f"      含「模型排计划」标签: {ai_on}；含「未生效」说明: {fell_back}", flush=True)
         check(ai_on or fell_back,
-              "执行记录里能看到「AI 参与排计划」的结果（生效，或如实说明未生效）")
+              "执行记录里能看到「模型参与排计划」的结果（生效，或如实说明未生效）")
         check(not fell_back or "回退规则版" in body,
-              "若 AI 未生效，界面如实说明已回退规则版（不假装 AI 排过）")
-        check("审计流水线" in body and "执行记录" in body, "结果区正常渲染")
+              "若模型未生效，界面如实说明已回退规则版（不假装模型排过）")
+        # 判「实际执行」而不是「执行记录」—— 后者在侧栏导航里恒有，等于没判。
+        check("审计流水线" in body and "实际执行" in body, "结果区正常渲染")
         check(not errors, f"控制台无 JS 报错（{len(errors)} 条）")
 
         browser.close()

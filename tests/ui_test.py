@@ -134,6 +134,45 @@ def tab_by_text(page, word: str):
     return None
 
 
+def goto_nav(page, label: str) -> bool:
+    """2026-10-26 界面改成「左侧导航 + 分页」后新增：内容不在第一屏了，要先点过去。
+
+    只点侧栏 radiogroup 里的 label —— 导航文案和页内标题常常同名（「审计发现」
+    既是导航项又是页标题），用 get_by_text 会点到不可见的那个。
+    """
+    try:
+        # 2026-10-26：结果刚出来的那一刻，侧栏可能还没挂上 DOM —— Streamlit 是流式渲染，
+        # 上面等的是「综合复现就绪度」这段文字，它在指挥台页里靠下，侧栏通常更早，
+        # 但不是一定。这里先等**导航容器本身**出现，再找 label，
+        # 免得在"结果已出、侧栏未挂"的空档里退化成 count=0 直接返回 False。
+        page.wait_for_selector('[data-testid="stSidebarUserContent"] [role="radiogroup"] label, [data-testid="stSidebar"] [role="radiogroup"] label',
+                               timeout=20000)
+        lab = page.locator('[data-testid="stSidebarUserContent"] [role="radiogroup"] label, [data-testid="stSidebar"] [role="radiogroup"] label'
+                           ).filter(has_text=label)
+        if not lab.count():
+            return False
+        lab.first.scroll_into_view_if_needed()
+        page.wait_for_timeout(300)
+        lab.first.click()
+        page.wait_for_timeout(2200)
+        return True
+    except Exception:
+        return False
+
+
+def reopen_inputs(page) -> bool:
+    """跑完一轮后输入区会被折叠成一条（B 方案改版），再次上传前要先点开。"""
+    try:
+        box = page.get_by_text("换一份材料", exact=False)
+        if not box.count():
+            return False
+        box.first.click()
+        page.wait_for_timeout(1200)
+        return True
+    except Exception:
+        return False
+
+
 def main():
     sample_missing = not PAPER.exists() or not CODE.exists()
     server_proc = ensure_server()
@@ -172,15 +211,30 @@ def main():
             note(f"## 2. 演示数据审计: {'✅ 跑通' if ok_res else '❌ 未出结果'}"
                  f" (耗时 {time.time() - t0:.1f}s)")
             if ok_res:
-                for t in ("审计可信度", "证据链总览", "审计发现"):
+                # 2026-10-26 分页改版：这三样都在「审计发现」页，默认落在总览页 ⇒ 先切页。
+                # 判据同步收窄：「审计发现」四字在导航里就有，改用页内 tab 文案「风险项」。
+                _moved = goto_nav(page, "审计发现")
+                note(f"   - 切到「审计发现」页: {'✅' if _moved else '❌'}")
+                for t in ("审计可信度", "证据链总览", "风险项"):
                     note(f"   - 结果区「{t}」: {'✅' if wait_text(page, t, 15000) else '❌'}")
             page.wait_for_timeout(1500)
             page.screenshot(path=str(OUT / "02_demo_result.png"), full_page=True)
-            note(f"   - 证据自证徽章: {'✅ 出现' if wait_text(page, '证据自证', 10000) else '❌ 未出现'}")
+            # 2026-10-26：全套里这一项偶发"未出现"（单独跑全过）。
+            # 根因不是功能坏：切页后发现卡片仍在渲染，`text=` 选择器对 st.html
+            # 里的大段文本命中不稳。改成轮询 body 文本（更宽松，判据不变）。
+            _vfy = False
+            for _ in range(20):
+                if "证据自证" in page.inner_text("body"):
+                    _vfy = True
+                    break
+                page.wait_for_timeout(1000)
+            note(f"   - 证据自证徽章: {'✅ 出现' if _vfy else '❌ 未出现'}")
         else:
             errors.append("未找到主按钮")
 
         # ---- B. 上传真实样本路径
+        # 2026-10-26：一轮跑完后输入区会折叠成一条，先点开再上传（否则上传控件不可见）。
+        note(f"   - 重新展开输入区: {'✅' if reopen_inputs(page) else '— 本来就是展开的'}")
         inputs = page.locator("input[type=file]")
         n_in = inputs.count()
         note(f"## 3. 上传真实样本({SAMPLE_NAME}): 上传控件 {n_in} 个"
@@ -283,16 +337,21 @@ def main():
             errors.append("未找到审计可信度标签页")
             note("## 5. 审计可信度标签页: ❌ 未找到")
 
-        # ---- D. 审计报告标签页
+        # ---- D. 审计报告（2026-10-26 改版：从「页签」变成左侧导航里的一页）
         tabr = tab_by_text(page, "审计报告")
         if tabr:
             tabr.click()
             page.wait_for_timeout(2000)
             page.screenshot(path=str(OUT / "06_report_tab.png"), full_page=True)
-            note("## 6. 审计报告标签页: ✅ 可打开(含 Markdown 报告与下载按钮)")
+            note("## 6. 审计报告: ✅ 可打开(含 Markdown 报告与下载按钮)")
+        elif goto_nav(page, "审计报告") and wait_text(page, "下载审计报告", 20000):
+            # 判据用下载按钮文案（报告页独有），不是「审计报告」四个字 ——
+            # 后者在导航里恒有，会变成假绿。
+            page.screenshot(path=str(OUT / "06_report_tab.png"), full_page=True)
+            note("## 6. 审计报告: ✅ 可打开(含 Markdown 报告与下载按钮)")
         else:
-            errors.append("未找到审计报告标签页")
-            note("## 6. 审计报告标签页: ❌ 未找到")
+            errors.append("未找到审计报告页")
+            note("## 6. 审计报告: ❌ 未找到")
 
         browser.close()
 
@@ -311,6 +370,11 @@ def main():
         note("(服务由本次测试自动拉起, 结束后仍在运行: http://localhost:8501)")
         (SAMPLES / "ui_test_report.md").write_text("\n".join(log), encoding="utf-8")
     print("UI TEST REPORT SAVED")
+    # 退出码必须跟着"有没有问题"走（2026-10-15 修）。
+    # 之前无论多少处 ❌ 都返回 0，于是体检里"界面 三路径真机实测"这一项**永远判 OK**，
+    # 形同虚设 —— 上传路径 300s 不出结果的那 5 处 ❌ 当时一点没拦住体检。
+    # 判据统一用 errors 列表（每处 ❌ 都往里 append），报告里打 ❌ 就会红。
+    sys.exit(1 if errors else 0)
 
 
 if __name__ == "__main__":

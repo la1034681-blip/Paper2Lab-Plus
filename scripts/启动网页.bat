@@ -3,7 +3,7 @@ chcp 65001 >nul
 cd /d "%~dp0"
 title Paper2Lab 启动器
 set PORT=8501
-set PY=%~dp0.venv\Scripts\python.exe
+set PY=%~dp0..\.venv\Scripts\python.exe
 
 if not exist "%PY%" (
   echo [错误] 未找到虚拟环境 .venv
@@ -29,7 +29,7 @@ echo   服务就绪后会自动打开浏览器(约 10 秒)
 echo ============================================================
 echo.
 
-start "Paper2Lab 服务窗口-关闭即停止服务" "%PY%" -m streamlit run "%~dp0app.py" --server.port %PORT% --server.address 127.0.0.1 --server.headless true --browser.gatherUsageStats false
+start "Paper2Lab 服务窗口-关闭即停止服务" "%PY%" -m streamlit run "%~dp0..\app.py" --server.port %PORT% --server.address 127.0.0.1 --server.headless true --browser.gatherUsageStats false
 
 echo 等待服务就绪...
 set /a n=0

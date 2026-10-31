@@ -20,7 +20,7 @@ for name in ("05_ViT", "02_DETR", "01_DDPM"):
         continue
     rf = d / "results.json"
     ur = json.loads(rf.read_text(encoding="utf-8")) if rf.exists() else None
-    audit, _ = run_audit(str(d / "paper.pdf"), str(d / "code.zip"), ur, plan_mode=True)
+    audit, _ = run_audit(str(d / "paper.pdf"), str(d / "code.zip"), ur)
     traces = trace_findings(audit)
     out.append("=" * 68)
     out.append(f"{name}：追查 {len(traces)} 个参数")
@@ -43,5 +43,8 @@ for name in ("05_ViT", "02_DETR", "01_DDPM"):
 out.append("—— 汇总口径 ——")
 out.append("  confidence=high/medium → 给出结论；none → 明确说'无法定位'，不猜")
 
-Path("_rc.txt").write_text("\n".join(out), encoding="utf-8")
+# 产物写到 .trash_tmp/，不在工程根目录留草稿（工作区卫生）
+_OUT = _pl.Path(__file__).resolve().parent.parent / ".trash_tmp"
+_OUT.mkdir(exist_ok=True)
+(_OUT / "_rc.txt").write_text("\n".join(out), encoding="utf-8")
 print("done")

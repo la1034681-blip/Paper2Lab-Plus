@@ -68,8 +68,10 @@ def main() -> int:
                 frame.wait_for_timeout(500)
             return False, t
 
-        ok0, before = wait_for("视觉读图通道")
-        check(ok0 and "无法读图" in before,
+        # 2026-10-30：页面文案从「视觉读图通道」改成「读图通道」，多模态不再靠勾选框。
+        # 线上可能还是旧版（未推送）⇒ **两套文案都认**，只认新版会把旧版误判成回归。
+        ok0, before = wait_for("读图通道")
+        check(ok0 and ("无法读图" in before or "本次不读图" in before),
               "初始状态：未配模型 API → 如实提示**无法读图**（评委打开就是这一屏）")
         page.screenshot(path=str(SHOTS / "L5_高级设置_未配.png"), full_page=True)
 
@@ -87,14 +89,17 @@ def main() -> int:
         setv(field("模型 API Key"), "dummy-key-not-used-no-api-call")
         setv(field("模型 Base URL"), "https://api.example.invalid/v1")
         setv(field("模型名"), "gpt-4o")
-        ok1, after = wait_for("复用①的模型 API")
+        ok1, after = wait_for("自己读图")
+        if not ok1:                                  # 旧版文案（线上可能还是旧版）
+            ok1 = "复用①的模型 API" in after
         check(ok1, "填多模态模型(gpt-4o) → 读图**复用模型 API**（无需视觉 key）")
         check("已就绪（gpt-4o）" in after, "主页面通道行显示 已就绪（gpt-4o）")
-        check("无法读图" not in after, "不再是「无法读图」状态")
+        check("无法读图" not in after and "本次不读图" not in after,
+              "不再是「无法读图」状态")
 
         setv(field("模型名"), "llama-3-70b")
-        ok2, t2 = wait_for("视觉读图通道")
-        check(ok2 and "复用①的模型 API" not in t2,
+        ok2, t2 = wait_for("读图通道")
+        check(ok2 and "复用①的模型 API" not in t2 and "自己读图" not in t2,
               "换单模态模型(llama-3-70b) → 不再复用模型 API 读图")
         page.screenshot(path=str(SHOTS / "L6_高级设置_多模态复用.png"), full_page=True)
         b.close()

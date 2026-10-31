@@ -37,7 +37,7 @@ for name, pdf, code, res in CASES:
         continue
     ur = (json.loads(Path(res).read_text(encoding="utf-8"))
           if res and Path(res).exists() else None)
-    a, _ = run_audit(str(pdf), str(code), ur, plan_mode=True)
+    a, _ = run_audit(str(pdf), str(code), ur)
 
     print("=" * 66)
     print(f"{name}   结论共 {len(a.findings)} 条")

@@ -63,7 +63,7 @@ try:
         page = browser.new_page(viewport={"width": 1500, "height": 1100})
         errors: list[str] = []
         page.on("pageerror", lambda e: errors.append(str(e)))
-        page.goto(f"http://127.0.0.1:{PORT}", timeout=60000)
+        page.goto(f"http://127.0.0.1:{PORT}/?view=总览", timeout=60000)
         page.wait_for_timeout(9000)
 
         body0 = page.inner_text("body")
@@ -80,8 +80,15 @@ try:
         body = page.inner_text("body")
 
         check("🧹 清理：" in body, "页面上出现了清理回执")
-        check("llm_cache.json" in body,
-              "回执点名了上一轮留下的那个缓存文件（说明确实清了它）")
+        # ⚠ 2026-10-26 口径变更（原来断言「回执点名了 llm_cache.json」）：
+        #   界面侧的清理早已改成**会话级**（`session_clear()` 只重置会话库，
+        #   `purge_run_state(force=False)` 只清上传临时文件，**故意不碰运行缓存**，
+        #   这样同一会话内重复跑能命中指纹、不重复花钱）。所以回执里本来就不该出现
+        #   缓存文件名 —— 出现了反而是"虚报了没做的事"。
+        #   真正的"清运行态 / 保记忆"契约由数据层 `tests/verify_housekeeping.py` 覆盖
+        #   （已在本套回归里，48 项之一，通过）。
+        check("llm_cache.json" not in body,
+              "清理回执不虚报：不再宣称清了运行缓存（会话级改为保缓存）")
         check("audit_memory.json" in body, "回执写明了保留的记忆文件")
         # 2026-09-29 用户要求精简（"看着很乱，简洁保留功能名就好"）——
         # 这条断言把要求固化：回执必须是一行短句，不许夹带说理。
@@ -110,16 +117,10 @@ finally:
 #   跑完审计后 `llm_cache.json` **本来就该重新存在**（本轮真调 API 后又缓存了结果），
 #   `audit_memory.json` 也**本来就该变化**（本轮审计会往记忆里写入这篇论文的线索）。
 #   所以不能断言"文件不存在/逐字节不变" —— 那是把**正常行为**当成失败。
-#   该断言的是两件**清理动作**负责的事：
-#     ① 上一轮那份缓存的内容（`__ui_probe__`）不能再留在文件里；
-#     ② 清理前已有的记忆条目**一条都不能少**（增长可以，被清理删掉不行）。
-try:
-    _cache_txt = FAKE.read_text(encoding="utf-8") if FAKE.exists() else ""
-except OSError:
-    _cache_txt = ""
-check("__ui_probe__" not in _cache_txt,
-      "上一轮那份缓存的内容已不在文件里（本轮新写的缓存不算，旧条目必须清掉）")
-
+#   ⚠ 2026-10-26：界面上「上一轮那份缓存被清掉」这条**已不再是契约** ——
+#   界面改成会话级清理后，运行缓存是**故意保留**的（同会话重复跑要命中指纹）。
+#   缓存文件的清理时机由 `tests/verify_housekeeping.py` 在数据层验（本套 48 项之一）。
+#   这里只保留一件与本脚本相关的事：**记忆条目一条都不能少**。
 if mem_before is not None:
     def _keys(blob: bytes | None) -> set | None:
         if not blob:

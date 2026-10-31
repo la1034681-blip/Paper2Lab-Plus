@@ -9,12 +9,21 @@
   诱饵误报          被误升级为不一致的"合法差异"条数（**越低越好**，单独看）
   解析成功          作答能被解析成结构化结果（0/1）
 
-要求达标的只是"作答可解析"；其余一律**如实报数**，不做通过/不通过判定 ——
-评测的产出是一个可横向比较的刻度，不是开关。
+  阶段三 3C 另加两项，用来量"多开一档能力多做了什么"（不开放能力时**不产出**）：
+  算出比例          有 ② 站实际值的结论占几成（没开计算员 = 未测，不是 0）
+  已判条数          被 ③ 站真正下过判定的结论数（没开审查员 = 未测）
+
+**测不出来的指标一律不产出、绝不填 0** —— 0 会被聚合成"表现极差"，
+而真相是"这一档根本没开这项能力"。作答里的 `metrics_available` 是这份白名单；
+缺这个字段时按**全量**处理（兼容旧作答与既有测试）。
 """
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List
+
+#: 全部指标（作答未标 metrics_available 时按这个全集算，兼容旧作答）
+ALL_METRICS = frozenset({"recall", "precision", "f1", "selfcheck_rate",
+                         "decoy_fp", "n_findings", "calc_coverage", "judged"})
 
 
 def _f1(p: float, r: float) -> float:
@@ -38,6 +47,9 @@ def evaluate_answer(
     expect = list(expect)
     decoy = list(decoy)
 
+    # 白名单：作答自己声明这一档能测什么；没声明 = 全量（旧作答 / 既有测试照旧）
+    avail = set(answer.get("metrics_available") or ALL_METRICS)
+
     found = set(answer.get("found_params", {}).get("paper", []))
     found |= set(answer.get("found_params", {}).get("code", []))
 
@@ -47,7 +59,8 @@ def evaluate_answer(
 
     inc: List[Dict[str, Any]] = list(answer.get("inconsistencies", []))
     n_inc = len(inc)
-    n_verified = sum(1 for i in inc if i.get("verified"))
+    # `verified is True` 才算数 —— None 表示"本档没判"，不能被当成通过
+    n_verified = sum(1 for i in inc if i.get("verified") is True)
     # 一条不一致都没报时，precision 记为 1.0（没冤枉人），但由 recall/自证率另作刻画
     precision = (n_verified / n_inc) if n_inc else 1.0
 
@@ -60,21 +73,27 @@ def evaluate_answer(
     # 错位值防线：被规则拒收（疑似错位）的抽取数 —— 拒得越准，精度越稳
     rejected = float((answer.get("coverage", {}) or {}).get("rejected", 0) or 0)
 
-    out: Dict[str, float] = {
-        "selfcheck_rate": round(selfcheck_rate, 4),
-        "decoy_fp": float(len(decoy_fp)),
-        "n_findings": float(n_inc),
-        "rejected": rejected,
-        "parse_ok": 1.0,
-    }
+    out: Dict[str, float] = {"parse_ok": 1.0}
+    if "decoy_fp" in avail:
+        out["decoy_fp"] = float(len(decoy_fp))
+    if "n_findings" in avail:
+        out["n_findings"] = float(n_inc)
+    out["rejected"] = rejected
     # 诱饵样本没有"期望项"，只考「别乱报」—— 不产出召回/精度，避免污染整体均值
-    if expect:
-        out.update({
-            "recall": round(recall, 4),
-            "precision": round(precision, 4),
-            "f1": round(_f1(precision, recall), 4),
-            "n_miss": float(len(miss)),
-        })
+    if expect and "recall" in avail:
+        out["recall"] = round(recall, 4)
+        out["n_miss"] = float(len(miss))
+    if expect and "precision" in avail:
+        out["precision"] = round(precision, 4)
+        out["f1"] = round(_f1(precision, recall), 4)
+    if "selfcheck_rate" in avail:
+        out["selfcheck_rate"] = round(selfcheck_rate, 4)
+    # 3C 两项：只有本档真开了对应能力才产出
+    if "calc_coverage" in avail:
+        n_calc = sum(1 for i in inc if i.get("calc"))
+        out["calc_coverage"] = round((n_calc / n_inc) if n_inc else 0.0, 4)
+    if "judged" in avail:
+        out["judged"] = float(sum(1 for i in inc if i.get("verified") is not None))
     return out
 
 

@@ -39,27 +39,48 @@ _DEEPSEEK_MODEL = "deepseek-chat"
 _MULTIMODAL_HINTS = (
     "-vl", "vl-", "vision", "-4v", "4v-", "glm-4v", "qwen-vl", "qwen2-vl", "qwen2.5-vl",
     "gpt-4o", "gpt-4.1", "gpt-5", "o4-mini", "gemini", "claude-3", "claude-4",
-    "claude-sonnet", "claude-opus", "mimo-v", "internvl", "llava", "minicpm-v",
+    "claude-sonnet", "claude-opus", "internvl", "llava", "minicpm-v",
     "step-1v", "ernie-4", "yi-vl", "pixtral", "phi-3.5-vision", "llama-3.2-vision",
     # 书生 InternLM 系列（2026-10-11 接入）：S1 / S2 均自带视觉编码器、可读图；
     # intern-latest 当前指向 intern-s2-preview-397b，同样多模态。
     # 不写这两组会误判"模型不能读图"，导致读图通道被白白关掉。
     "intern-s2", "intern-s1", "intern-latest",
+    # DeepSeek 多模态（2026-10-24 实测，端点 api.deepseek.com/v1）：
+    # `deepseek-chat` 带 image_url 能正确识图（返回图上的文字，prompt_tokens 含图）；
+    # 而 `deepseek-v4-pro` **不能** —— 它不报错，回 content="" 并在 reasoning_content
+    # 里说 "Unsupported Image"。所以这里**只精确匹配 chat**，**绝不写成泛词 "deepseek"**，
+    # 否则会把 v4-pro 误判成多模态，读图全静默失败。
+    "deepseek-chat",
 )
 
 
-def looks_multimodal(model: str, base_url: str = "") -> bool:
-    """按模型名**猜**它是否自带读图能力（多模态）。
+def modality_hit(model: str) -> str:
+    """返回模型名里命中的那个**视觉标识片段**（没命中返回空串）。
 
-    ⚠️ 这只是"猜"：真正的能力判断权在用户手里（页面上有勾选框可覆盖）。
-    猜错的代价不对称 —— 猜成"不能读图"最多是多配一个视觉 key；
-    猜成"能读图"而实际不能，会导致读图调用全部失败。所以这里的规则**偏保守**：
-    只认明确的视觉模型命名特征，认不出就返回 False。
+    为什么要把"命中了哪个词"单独抛出来：页面上要如实写「依据：模型名含 `-vl`」。
+    只报结论「已识别为多模态」是不够的 —— 用户改了模型名却是另一种结果时，
+    看不到依据就只能猜程序是不是坏了。
     """
     m = (model or "").strip().lower()
     if not m:
-        return False
-    return any(h in m for h in _MULTIMODAL_HINTS)
+        return ""
+    for h in _MULTIMODAL_HINTS:
+        if h in m:
+            return h
+    return ""
+
+
+def looks_multimodal(model: str, base_url: str = "") -> bool:
+    """按模型名**判**它是否自带读图能力（多模态）。
+
+    ⚠️ 2026-10-30 起页面上**不再有勾选框**：识别结果直接用于判定，页面如实写出
+    「识别成什么 + 依据是什么 + 能读什么 / 要注意什么」。要改判定就改模型名
+    （或改这里的词表），不靠用户手动覆盖 —— 少一个开关，就少一处「勾了却没生效」。
+    猜错的代价不对称 —— 猜成"不能读图"最多是少读图（并如实说明）；
+    猜成"能读图"而实际不能，会导致读图调用全部失败。所以规则**偏保守**：
+    只认明确的视觉模型命名特征，认不出就返回 False。
+    """
+    return bool(modality_hit(model))
 
 
 def resolve_endpoint(api_key: str = "", base_url: str = "",
@@ -72,6 +93,117 @@ def resolve_endpoint(api_key: str = "", base_url: str = "",
     m = ((model or "").strip() or get("LLM_MODEL") or get("DEEPSEEK_MODEL")
          or _DEEPSEEK_MODEL)
     return k, u, m
+
+
+# ---- 调用预算：按端点自动定 token/超时（2026-10-30 本地模型接入）----------
+# 背景：本地 llama.cpp 服务（Intern-S1-mini，8B / Q8 / 8GB 显卡）实测约
+#   **10 token/s**，而云端 deepseek-chat 是 100+ token/s —— 相差一个数量级。
+#   同一套 1800 token / 75s 的预算，在本地意味着"必然超时"（1800/10 = 180s）。
+# 口径：**一个判定只有一处真相** —— 是否本地、给多少额度，都只在这里定，
+#   调用方（qa.py）不许再写 1800 / 75 这类字面量。
+_LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+
+def is_local_endpoint(base_url: str = "") -> bool:
+    """本次调用是否打向**本机**服务（本地推理慢，预算必须放宽）。"""
+    from urllib.parse import urlparse
+
+    from .envfile import get
+    u = ((base_url or "").strip() or get("LLM_BASE_URL")
+         or get("DEEPSEEK_BASE_URL") or _DEEPSEEK_BASE_URL)
+    try:
+        host = (urlparse(u).hostname or "").strip().lower()
+    except Exception:          # noqa: BLE001 — 地址不合规就当远程，交给调用层报错
+        host = ""
+    return host in _LOCAL_HOSTS
+
+
+def qa_budget(base_url: str = "") -> tuple[int, float]:
+    """问答用的 `(max_tokens, timeout)`。
+
+    · 远程（deepseek / 书生云端）：1800 / 75s —— 原口径不动，四段式写得开；
+    · 本机（llama.cpp）：1000 / 360s —— 1000 token 约 100s 生成完，
+      给 360s 是留足 prompt 处理与显卡抖动；额度压到 1000 是为了让用户
+      **两分钟内看到答案**，而不是"答得更全但等三分钟"。
+    """
+    if is_local_endpoint(base_url):
+        return 1000, 360.0
+    return 1800, 75.0
+
+
+# ---- 非 API 地址识别（2026-10-31 实测踩坑，凭据 cache/qa_errors.log）----------
+# 把 Base URL 填成「网页控制台」地址（platform.deepseek.com）时，请求根本到不了
+# 模型：WAF 直接拦下，回一张 HTML「Error - Request Blocked」页 + 状态码 429，
+# SDK 把它包成 RateLimitError。若上层按「限流」处理（退避重试 + 提示"稍后再问"）
+# 就是误诊 —— 重试一万次也不会通，还白等 9 秒。
+# 这里只列**确认过**的对照，不猜；拿不准的一律返回空串，交给调用层如实报错。
+_NON_API_HOSTS = {
+    "platform.deepseek.com": "https://api.deepseek.com",
+    "www.deepseek.com": "https://api.deepseek.com",
+    "deepseek.com": "https://api.deepseek.com",
+}
+
+
+def endpoint_url_hint(base_url: str = "") -> str:
+    """`base_url` 指向已知的**网页控制台/门户**时，返回一句人话纠正；否则返回空串。"""
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse((base_url or "").strip()).hostname or "").strip().lower()
+    except Exception:          # noqa: BLE001 — 不合规地址交给调用层如实报错
+        return ""
+    api = _NON_API_HOSTS.get(host)
+    if api:
+        return f"{host} 是网页控制台，不是 API 地址；API 地址是 {api}"
+    return ""
+
+
+def looks_non_api_reply(ex: BaseException) -> bool:
+    """异常内容显示**对端根本不是 API**（回的是 HTML 拦截页，而不是 JSON 错误体）。
+
+    正常 OpenAI 兼容服务的错误体是 JSON（`{"error": {...}}`）；
+    出现 `<!DOCTYPE` / `<html` / `Request Blocked` 说明打到了网页/WAF。
+    """
+    low = str(ex).lower()
+    return ("<!doctype" in low or "<html" in low or "request blocked" in low)
+
+
+def probe_local(*, port: int = 0, timeout: float = 0.9) -> dict:
+    """探测本机是否已有部署好的 OpenAI 兼容模型服务（页面三级优先级的第二层）。
+
+    为什么需要（2026-10-30 用户定）：用户没在页面填 API 时，先看看本机有没有
+    跑着模型（桌面『书生本地模型』那个 llama.cpp，默认 `127.0.0.1:8080`）。
+    有就直接用 —— 不让用户为了"本机明明已经有"再去申请云端 Key。
+
+    返回 `{ok, url, model, port, note}`，**绝不抛异常**：
+    探测不到是正常状态（大多数机器都没跑本地模型），不能把页面带崩。
+
+    ⚠ **必须绕开 HTTP 代理**：本机常设 `http_proxy`，urllib 会照着走，
+      对 127.0.0.1 的请求会被代理劫持成 502（2026-10-29 已踩过同类坑）。
+      `ProxyHandler({})` 空表 = 一个代理都不认。
+    ⚠ 端口可用 `PAPER2LAB_LOCAL_PORT` 覆盖（默认 8080），换端口不用改代码。
+    """
+    import json as _json
+    import urllib.request as _rq
+
+    from .envfile import get
+    try:
+        p = int(port or (get("PAPER2LAB_LOCAL_PORT") or "8080").strip() or 8080)
+    except (TypeError, ValueError):
+        p = 8080
+    base = f"http://127.0.0.1:{p}/v1"
+    try:
+        opener = _rq.build_opener(_rq.ProxyHandler({}))
+        with opener.open(base + "/models", timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace") or "{}"
+        data = _json.loads(raw)
+        items = data.get("data") or []
+        mid = ""
+        if items and isinstance(items[0], dict):
+            mid = (items[0].get("id") or "").strip()
+        return {"ok": True, "url": base, "model": mid, "port": p, "note": ""}
+    except Exception as ex:        # noqa: BLE001 — 探测失败就是"没有"，不是错误
+        return {"ok": False, "url": base, "model": "", "port": p,
+                "note": type(ex).__name__}
 
 
 def resolve_vision(*, page_key: str = "", page_url: str = "", page_model: str = "",
@@ -95,8 +227,10 @@ def resolve_vision(*, page_key: str = "", page_url: str = "", page_model: str = 
       · ok=False → reason 是**给用户看的**人话原因（不能是空串）
 
     优先级（**页面意图 > 服务端默认**，与本项目一贯口径一致）：
-      1. 页面②成对填了 Key+URL          → 用它
-      2. 页面勾了「多模态」且①成对       → 复用①的模型 API
+      1. 页面②成对填了 Key+URL          → 用它（2026-10-30 起页面已无这组输入，
+                                            该分支只为 CLI / 老调用方保留）
+      2. ①的模型被判为多模态且成对       → 复用①的模型 API
+         （判定来源：`looks_multimodal(model)` 按模型名自动识别，页面不再有勾选框）
       3. 页面②只填了 Key 没填 URL       → 失败（提示补 URL）
       4. 服务端①成对 / 厂商专用变量      → 用它
       5. 服务端只填了 Key 没填 URL      → 失败
@@ -118,8 +252,9 @@ def resolve_vision(*, page_key: str = "", page_url: str = "", page_model: str = 
                 "source": "页面输入", "from_llm": False, "reason": "",
                 "warning": ""}
 
-    # ② 页面勾了「多模态」且①成对 → 复用①的模型 API
-    #    （刻意排在服务端之前：勾选框是**页面上的明确选择**，不该被 .env 里遗留的视觉 key 架空）
+    # ② ①的模型被判为多模态且成对 → 复用①的模型 API
+    #    （刻意排在服务端之前：页面填的模型是**明确的当前意图**，不该被 .env 里遗留的
+    #      视觉 key 架空 —— 否则用户换了多模态模型，读图却还在偷偷走旧的视觉端点。）
     if llm_multimodal and lk and lu:
         return {"ok": True, "key": lk, "url": lu, "model": lm,
                 "source": "复用模型 API（多模态）", "from_llm": True, "reason": "",
@@ -148,8 +283,8 @@ def resolve_vision(*, page_key: str = "", page_url: str = "", page_model: str = 
     elif llm_multimodal and not lu:
         why = "①自称多模态但**没有填 Base URL**，无法复用它读图（成对填写才生效）"
     else:
-        why = (f"①的模型 `{lm}` 不支持读图（未勾选「该模型本身可以读图」），"
-               "且未配置视觉模型 API")
+        why = (f"①的模型 `{lm}` 按模型名判定为单模态（不含 `-vl` / `vision` / `4v` 这类标识），"
+               "服务端也没有另配视觉模型 API")
     return {"ok": False, "key": "", "url": "", "model": "", "source": "",
             "from_llm": False, "reason": why, "warning": ""}
 
@@ -312,27 +447,112 @@ def _deepseek_model() -> str:
     return get("LLM_MODEL") or get("DEEPSEEK_MODEL") or _DEEPSEEK_MODEL
 
 
+# ---------------------------------------------------------------- 运行代次 + 本机串行
+# 2026-10-30 晚（用户要求）：「点一次新的，就把上一次终止、清理干净再跑」。
+#
+# 为什么必须有：本地 llama.cpp 是**单实例单槽**，上下文总量有限；
+# 一问一答就要 2500+ token，两个请求同时进来必然把共享上下文挤爆
+# （实测报 500 `Context size has been exceeded`）或触发限流（429）。
+# 用户看到的就是「模型调用失败」，而下面还挂着一屏审计事实 —— 很像程序坏了。
+#
+# 三层保护，缺一不可：
+#   ① `begin_run()`：每次点击生成新令牌，**旧令牌立刻作废**。旧任务在
+#      **下一次模型调用前**发现自己过期就抛 `RunCancelled` 停手，结果丢弃。
+#      ⚠ Python 无法硬中断在途的 HTTP 请求，所以"终止"的粒度 = 这一次模型调用。
+#   ② `_LOCAL_LOCK`：本机端点**串行**，一个时刻只有一个请求打到 llama.cpp。
+#      所以旧请求还在途时，新任务只是排队，绝不会并发挤爆上下文。
+#   ③ 本机端点 `trust_env=False` + `max_retries=0`：
+#      · 不走系统/环境代理 —— 本机地址经过代理既慢又可能被代理限流（429 的常见来源）；
+#      · 不自动重试 —— 重试只会把并发叠得更高，还让用户多等一倍时间。
+class RunCancelled(Exception):
+    """本次运行已被新的一次点击作废。**不是错误**，不要当失败报给用户。"""
+
+
+_run_seq = 0
+_run_seq_lock = threading.Lock()
+_RUN_LOCAL = threading.local()      # 本线程"这一轮"的令牌（Streamlit 每次 rerun 是新线程）
+_LOCAL_LOCK = threading.Lock()
+
+
+def begin_run() -> int:
+    """开始一次新运行并作废上一次，返回本次令牌。"""
+    global _run_seq
+    with _run_seq_lock:
+        _run_seq += 1
+        tok = _run_seq
+    _RUN_LOCAL.token = tok
+    return tok
+
+
+def current_run() -> Optional[int]:
+    """**本线程**这一轮的令牌；`None` = 本线程不受管辖。"""
+    return getattr(_RUN_LOCAL, "token", None)
+
+
+def check_run(token: Optional[int] = None) -> None:
+    """令牌过期就抛 `RunCancelled`。
+
+    ⚠ 两个最容易写错的地方（10-30 晚都踩过）：
+      ① 不能拿「全局最新令牌」自己跟自己比 —— 那样恒等、永远不取消。
+         必须比 **本线程开跑时的令牌** vs **当前全局最新令牌**；
+      ② 没调过 `begin_run()` 的线程（脚本、测试、一次性调用）**必须放行**。
+         否则任何命令行调用都会被判成"已作废"，把既有测试全打挂。
+    """
+    t = current_run() if token is None else token
+    if t is None:                   # 本线程没有令牌 ⇒ 不受管辖，一律放行
+        return
+    with _run_seq_lock:
+        latest = _run_seq
+    if t != latest:
+        raise RunCancelled("已被更新的一次点击作废")
+
+
 def _call_deepseek(prompt: str, api_key: str, max_tokens: int = 300,
-                   base_url: str = "", model: str = "") -> str:
+                   base_url: str = "", model: str = "",
+                   timeout: float = 30.0, run_token: Optional[int] = None) -> str:
     """调用 OpenAI 兼容的 chat.completions。
 
     `base_url` / `model` 为空时回落到 .env / 环境变量 / 官方默认 —— 因此
     **不传参的老调用点行为完全不变**。
+
+    `timeout`：2026-10-30 加。默认仍是 30s（老调用点不变），但**问答**必须给更长 ——
+    书生 intern-s2 会先把推理写进正文，1500 token 要 40s 以上，30s 一定超时，
+    用户看到的就是"模型调用失败"（实测：问答 92s 后超时、退回证据检索）。
+
+    `run_token`：2026-10-30 晚加。「点击即终止上一次」靠它 —— 传了就只认这个令牌，
+    不传就用当前全局令牌（这样流水线里几十个老调用点不用逐个改）。
     """
+    import httpx
     from openai import OpenAI
 
     from .envfile import get
     url = (base_url or "").strip() or get("LLM_BASE_URL") or get("DEEPSEEK_BASE_URL") \
         or _DEEPSEEK_BASE_URL
     name = (model or "").strip() or _deepseek_model()
-    client = OpenAI(api_key=api_key, base_url=url, timeout=30)
-    resp = client.chat.completions.create(
-        model=name,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=max_tokens,
-    )
-    return (resp.choices[0].message.content or "").strip()
+    local = is_local_endpoint(url)
+    # 本机：不走代理（trust_env=False）+ 不自动重试；远程：保持 SDK 默认（要吃代理、要重试）
+    kwargs: dict = {"api_key": api_key, "base_url": url, "timeout": timeout}
+    if local:
+        kwargs["max_retries"] = 0
+        kwargs["http_client"] = httpx.Client(trust_env=False, timeout=timeout)
+    client = OpenAI(**kwargs)
+
+    def _fire() -> str:
+        resp = client.chat.completions.create(
+            model=name,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=max_tokens,
+        )
+        return (resp.choices[0].message.content or "").strip()
+
+    if not local:
+        check_run(run_token)
+        return _fire()
+    # 本机串行：排队后**先看自己是否已作废**，作废就别白跑一次生成
+    with _LOCAL_LOCK:
+        check_run(run_token)
+        return _fire()
 
 
 # ---------------------------------------------------------------- 一次性 JSON 问答
@@ -394,12 +614,27 @@ def ask_json(prompt: str, api_key: str, *, mode: str = "aux",
     #   这类抖动重试一次就能过去。**API 层异常（鉴权/网络）不重试** —— 那种重试也是白费。
     #   重试必须**如实说出来**（"第 2 次尝试才成功"），不能假装一次就成。
     text, last_note = "", "未调用"
+    # ---- 2026-10-31 本机模型实测暴露的两个真 bug，都在这一行调用上 --------------
+    # ① `base_url` / `model` 两个参数**收了却没用**：ask_json 从头到尾只调
+    #    `_call_deepseek(prompt, api_key, max_tokens=...)`，端点/模型一律回落到 .env。
+    #    后果不是报错，而是**静默用错模型** —— 页面里填云端、排计划却打本机（或反过来）。
+    #    这条影响全部 9 个调用点：排计划 / 模型先判 / 角色 / 自主回头 / 补丁提名 /
+    #    引证核验 / 实验站挑工具 / 抽取 Agent。这里补上转发。
+    # ② 超时写死 30s（`_call_deepseek` 的默认值）。本机 8B 实测约 10 token/s，
+    #    900~1400 token 的 JSON 计划要 90~140s ⇒ **必定超时** ⇒ `planner` 永远是 `rule`、
+    #    模型先判永远"没判出结果"，而界面只显示"模型没参与"，看不出是超时。
+    #    改成按端点折算：远程维持 30s 不变（老行为零变化），本机按 max_tokens 估时。
+    _timeout = 30.0
+    if is_local_endpoint(base_url):
+        _timeout = min(300.0, max(90.0, max_tokens / 8.0 + 30.0))
     for attempt in (1, 2):
         try:
-            text = _call_deepseek(prompt, api_key, max_tokens=max_tokens)
+            text = _call_deepseek(prompt, api_key, max_tokens=max_tokens,
+                                  base_url=base_url, model=model,
+                                  timeout=_timeout)
         except Exception as ex:      # noqa: BLE001
             return None, (f"AI（{mode}）· 调用失败（{type(ex).__name__}）"
-                          "，回退确定性路径")
+                          f"，回退确定性路径")
         obj = _extract_json(text)
         if obj is not None:
             with _aux_lock:

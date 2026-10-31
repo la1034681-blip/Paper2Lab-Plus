@@ -92,10 +92,15 @@ _PROMPT = """你是科研复现审计助手。这是论文/实验材料的图片
 
 
 def _default_model_for(base_url: str) -> str:
-    """按接口地址猜默认模型名(可用 VISION_MODEL 覆盖)。"""
+    """按接口地址猜默认模型名(可用 VISION_MODEL 覆盖)。
+
+    2026-10-24：小米 MiMo 下线，首选改为 DeepSeek（`deepseek-chat` 实测可读图，
+    见 `_call_vision` 的空内容保护说明）。老配置（base_url 含 xiaomimimo）不再
+    特判 —— 反正没有可用的 MiMo 模型名了，硬猜只会得到一次必然失败的调用。
+    """
     b = (base_url or "").lower()
-    if "xiaomimimo" in b or "mimo" in b:
-        return "mimo-v2.5"
+    if "deepseek" in b:
+        return "deepseek-chat"
     if "bigmodel" in b:
         return "glm-4v-plus"
     if "dashscope" in b:
@@ -115,14 +120,13 @@ def _provider(api_key: str = "", base_url: str = "",
         if base_url:
             return (api_key, base_url, model or _default_model_for(base_url),
                     "页面输入")
-        if api_key.startswith("tp-") or api_key.startswith("ttp-"):
-            return (api_key, "https://token-plan-cn.xiaomimimo.com/v1",
-                    model or "mimo-v2.5", "页面输入(MiMo Token Plan)")
         if api_key.count(".") >= 1 and not api_key.startswith("sk-"):
             return (api_key, "https://open.bigmodel.cn/api/paas/v4",
                     model or "glm-4v-plus", "页面输入(智谱 GLM-4V)")
-        return (api_key, "https://api.xiaomimimo.com/v1",
-                model or "mimo-v2.5", "页面输入(MiMo sk-)")
+        # 只填 key 不填 URL 时的兜底：与①模型 API 的默认端点保持一致（DeepSeek 官方）。
+        # 页面②本来就会先拦一次（Key 与 Base URL 必须成对），走到这里多数是老配置。
+        return (api_key, "https://api.deepseek.com/v1",
+                model or "deepseek-chat", "页面输入(DeepSeek)")
     # 2) 环境变量 / .env
     k = get("VISION_API_KEY")
     u = get("VISION_BASE_URL")
@@ -192,7 +196,13 @@ def extract_image_regions(pdf_path: str, max_regions: int = _MAX_REGIONS,
     thin_cands: set[int] = set()      # 候选中的文本稀薄页
     plain_pages: list[int] = []       # 因"文本完整且未提参数"而跳过的插图页
     read_all_imgs = _read_all_images()
-    with fitz.open(pdf_path) as doc:
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:      # noqa: BLE001
+        # 打不开的论文(伪 PDF / 损坏文件): 这里没有图可读, 如实返回空候选,
+        # 不能把 FileDataError 抛到上层 —— 那会让整次审计崩在"读图"这一步。
+        return cands
+    with doc:
         for i, page in enumerate(doc, 1):
             if only_pages is not None and i not in only_pages:
                 continue
@@ -282,6 +292,13 @@ def _call_vision(png: bytes, model: str, base_url: str, api_key: str,
     except TypeError:
         resp = client.chat.completions.create(max_tokens=1500, **kwargs)
     raw = (resp.choices[0].message.content or "").strip()
+    if not raw:
+        # 空内容必须当**失败**，不能当"读了但没读出参数"。
+        # 2026-10-24 实测：`deepseek-v4-pro` 收到图片时**不报错**，而是回 content=""，
+        # 只在 reasoning_content 里自言自语 "图片未显示/unsupported"。
+        # 若这里静默返回 {}，上层会记成"这页图确实没有参数"—— 属于假成功，
+        # 比直接失败更危险（评委看到的是"看了图但没抓到东西"，我们却以为一切正常）。
+        raise RuntimeError("模型返回空内容（多半是该模型不支持读图，或图片未被接受）")
     return _parse_json(raw)
 
 
@@ -502,7 +519,7 @@ def analyze_images(pdf_path: str, max_regions: Optional[int] = None,
             f"{len(meta['thin_candidates'])} 页), 本次按上限读取前 {meta['max_regions']} 个; "
             f"另 {meta['skipped_by_cap']} 个区域**未读图**, 其内容未参与审计"
             + (f"(其中稀薄页: 第 {', '.join(map(str, _skip))} 页)" if _skip else "")
-            + "。如需覆盖更多页面, 把「读图区域上限」设为 0(全部)后重跑"
+            + "。如需覆盖更多页面, 把 PAPER2LAB_VISION_MAX_REGIONS 设为 0(全部)后重跑"
               "(结果按图缓存, 已读过的不会重复计费)。")
     return found, meta
 

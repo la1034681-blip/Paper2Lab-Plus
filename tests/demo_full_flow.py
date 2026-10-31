@@ -62,7 +62,14 @@ _CN = [
 ]
 
 ALL = "--all" in sys.argv
-if ALL:
+_named = [a for a in sys.argv[1:] if not a.startswith("--")]
+if _named:
+    # 按名跑子集（如 01_DDPM 03_NeRF 05_ViT），产物另存 subset，不覆盖 --all 的全量报告
+    _pool = {c[0]: c for c in (_REAL + _CN)}
+    CASES = [_pool[n] for n in _named if n in _pool]
+    OUT_NAME = "full_flow_subset.md"
+    TITLE = f"全流程演示（{len(CASES)} 套：{' / '.join(c[0] for c in CASES)}）"
+elif ALL:
     CASES = _REAL + _CN
     OUT_NAME = "full_flow_all_cases.md"
     TITLE = "全流程演示（全量 8 套）"
@@ -92,7 +99,7 @@ for name, pdf, code, results_path, real_api, why in CASES:
     t0 = time.time()
     try:
         audit, report = run_audit(str(pdf), str(code), ur,
-                                  force_mock=not real_api, plan_mode=True)
+                                  force_mock=not real_api)
     except Exception as e:  # noqa: BLE001
         out += [f"  ✗ 审计失败: {type(e).__name__}: {e}", ""]
         summary.append({"name": name, "err": f"{type(e).__name__}: {e}"})

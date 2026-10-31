@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import time
+from time import monotonic as _mono
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
@@ -121,7 +122,7 @@ def fill_missing(paper: PaperInfo, pdf_path: str, *,
         report.budget = _budget(0, 0, 0, 0.0, max_llm_calls, max_vision_calls, max_seconds)
         return report
 
-    t_start = time.time()
+    t_start = _mono()
     used = {"llm": 0, "vision": 0}
     seq = 0
 
@@ -131,7 +132,7 @@ def fill_missing(paper: PaperInfo, pdf_path: str, *,
         LLM / 视觉预算耗尽**只跳过对应那一级**, 不影响其余级
         （否则前一个参数会挤占后一个参数的机会, 结果还受 targets 排序影响）。
         """
-        if time.time() - t_start >= max_seconds:
+        if _mono() - t_start >= max_seconds:
             return f"总耗时预算已用尽({int(max_seconds)}s)"
         return ""
 
@@ -227,7 +228,7 @@ def fill_missing(paper: PaperInfo, pdf_path: str, *,
                      "（宁可不报, 也不报可能错的）"))
 
     report.budget = _budget(len(report.steps), used["llm"], used["vision"],
-                            time.time() - t_start,
+                            _mono() - t_start,
                             max_llm_calls, max_vision_calls, max_seconds)
     if not report.stopped_reason:
         report.stopped_reason = "已完成全部待补目标"

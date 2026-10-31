@@ -6,7 +6,7 @@
 
 选项:
     --mode classic|multagent   审计链路（默认 classic，最快）
-    --loop                     追加「算 / 搜 / 做 + 迭代回边」四件套
+    --loop                     追加 ② 算 / ③ 核验 / ④ 方案与迭代回边（四站贯通）
     --llm                      允许调用大模型（默认关闭，成本为零）
     --report                   在结果里带上完整 Markdown 报告（默认只给预览）
     --pretty                   缩进输出，便于人读
@@ -58,7 +58,7 @@ def main(argv=None) -> int:
     ap.add_argument("--mode", default="classic", choices=("classic", "multagent"),
                     help="经典链（默认）或多智能体对撞链")
     ap.add_argument("--loop", action="store_true",
-                    help="追加「算 / 搜 / 做 + 迭代回边」")
+                    help="追加 ② 算 / ③ 核验 / ④ 方案与迭代回边（四站贯通）")
     ap.add_argument("--llm", action="store_true",
                     help="允许调用大模型（默认关闭，成本为零）")
     ap.add_argument("--report", action="store_true",
