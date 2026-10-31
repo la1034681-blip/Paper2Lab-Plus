@@ -45,3 +45,11 @@ _svc_keys_log.txt
 # 把结果写到了工程根，纯本地台账，跟线上应用无关）
 _memc.txt
 _p23.txt
+
+# ---- 文档与报告 md：暂不入库，本地留档 ----
+# demo/*.md 全是脚本跑完写出来的审计报告（tools/run_audit_cli.py 等的输出目标）
+# docs/*.md 是技术方案、体检报告、评委介绍等文档稿
+# 公开仓库只留根 README，以及 skills/ 下的技能说明书（删了技能包就废）
+*.md
+!README.md
+!skills/**/*.md
